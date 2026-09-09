@@ -9,7 +9,7 @@
 
 ## 状态
 
-R0 脚手架：包布局、构建、检查链与入口点占位已就绪，`npm run check` 全绿；领域实现按 handoff 的 R1 → R4 推进。
+R0–R4 全部落地，`npm run check` 全绿（69 个单测 + 1 个 opt-in 集成测试）：核心 schema / store / apply 漏斗 / projection view / lane 布局、Claude Code harness（transcript 增量投影 + fork 执行器）、维护作业与 CLI、dsh 插件 smoke。
 
 ## 三层架构（依赖方向单向）
 
@@ -65,19 +65,42 @@ npm run build     # tsc -p tsconfig.build.json → dist/
 
 安装时 npm 会 clone、装 devDependencies 并跑 `prepare`（`tsc` 构建 `dist/`），不需要发布到 npm。本地联调：在本仓库 `npm link`，在消费方 `npm link agent-conversation-exploration-thread-graph`。
 
-## 裸用法（无 Kanban，规划中）
+## 裸用法（无 Kanban）
 
-在 `~/.claude/settings.json` 里给 Stop hook 挂一条命令：
+在 `~/.claude/settings.json` 里给 Stop hook 挂一条命令。`--final-turn-completed` 是关键：
+Stop 边沿意味着末 turn 已经结束，不给这个开关的话末 turn 会被当成「进行中」而不参与判定。
 
 ```bash
 agent-conversation-exploration-thread-graph maintain \
 	--exploration-id <根会话 session id> \
 	--store-root ~/.agent-conversation-exploration-thread-graph \
-	--session '<ConversationSessionRef JSON>' \
-	--mode incremental
+	--session '{"harnessKind":"claude_code","nativeSessionId":"<session id>","transcriptPath":"~/.claude/projects/<encoded-cwd>/<session id>.jsonl","workingDirectory":"<repo>","launchArgvTemplate":{"model":"default","appendSystemPrompt":null,"settingsPath":null,"extraArgs":[]}}' \
+	--mode incremental --final-turn-completed
 ```
 
-然后 `agent-conversation-exploration-thread-graph get --exploration-id <id> --store-root <dir> --view` 输出 projection 整值。子命令的完整参数见 handoff A.7。
+读回来：
+
+```bash
+# 落盘的 collection
+agent-conversation-exploration-thread-graph get --exploration-id <id> --store-root <dir>
+# 给宿主渲染的 projection 整值（需要 --session 才能摊出 turn 行）
+agent-conversation-exploration-thread-graph get --exploration-id <id> --store-root <dir> --view --session '<json>'
+# 分身要满足的 JSON Schema（调试用）
+agent-conversation-exploration-thread-graph schema
+# 体检：transcript 可读、fork 参数模板完整、没有会绕过 hooks 的参数
+agent-conversation-exploration-thread-graph doctor --session '<json>'
+```
+
+首次接入一个已经聊了很久的会话时先跑一次 `--mode initial_backfill`（可用 `--batch-size` 分批），
+之后每个 turn 用 `--mode incremental`。`storeRoot` 省略时默认 `~/.agent-conversation-exploration-thread-graph`。
+
+### 成本提醒
+
+维护作业每次都会 fork 主会话，而 Claude Code 的 `--fork-session` 目前**拿不到主会话的 prompt cache**
+（Anthropic 已确认的 open bug [#77306](https://github.com/anthropics/claude-code/issues/77306)，2.1.266 上仍复现）。
+2026-09-10 实测：220k 上下文的 opus 会话，单次作业约 $2.2–2.4，且随上下文线性增长。
+所以**不要每个 turn 都跑**——用触发稀释（每 N 个 turn 一次），或用 `--model` 降档。
+该 bug 修好后成本会自动回落；dsh 的 fork-in-process 不受影响。
 
 ## 与宿主的契约
 

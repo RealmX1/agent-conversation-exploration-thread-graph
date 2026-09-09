@@ -159,14 +159,23 @@ type ConversationSessionRef =
 	| { harnessKind: "codex"; nativeSessionId: string; rolloutPath: string; workingDirectory: string; /* R3 补 */ }
 	| { harnessKind: "dsh"; nativeSessionId: string };
 
-// ── store / 漏斗 / 视图 / 布局
-readExplorationThreadGraphCollection(storeRoot, explorationId) / mutateExplorationThreadGraphCollection(...)   // durable-write-before-ack
-applyExplorationThreadGraphMaintenanceProposal({ explorationId, proposal, turnSnapshotsBySession, current, revisionWindow }) → { accepted, collection } | { rejected, reason }
-buildExplorationThreadGraphProjectionView(collection, turnSnapshotsBySession) → ExplorationThreadGraphProjectionView
-layoutThreadGraphLanes(rows: { id: string; parentIds: string[] }[]) → ThreadGraphLaneLayoutRow[]
+// ── store / 漏斗 / 视图 / 布局（R1 落地后的最终签名）
+readExplorationThreadGraphCollection(storeRoot, explorationId, now?) / readExplorationTopicRegistry(storeRoot)
+mutateExplorationThreadGraph(storeRoot, explorationId, mutator, now?)   // collection 与 topic 注册表同锁落盘；durable-write-before-ack
+applyExplorationThreadGraphMaintenanceProposal({
+  explorationId, proposal /* 未校验，闸 1 在漏斗内做 */, turnSnapshotsBySession,
+  proposalSourceTurnSequenceSignatureBySession,   // 作业发起时读到的签名，闸 8 拿它对账
+  currentCollection, currentTopicRegistry,        // 漏斗要跨两者派生 id / 复用 topic
+  revisionWindowTurnCount?, maintenanceJobUsage?, now,
+}) → { outcome: "accepted"; collection; topicRegistry }
+  | { outcome: "rejected"; rejectionReason; collectionStaleMarkUpdate }   // 后者非 null 时调用方原样写盘（闸 8 的「拒绝并标 stale」）
+buildExplorationThreadGraphProjectionView(collection, turnSnapshotsBySession, topicRegistry) → ExplorationThreadGraphProjectionView
+layoutThreadGraphLanes(rows: { id: string; parentIds: string[] }[]) → ThreadGraphLaneLayoutRow[]   // rows 必须**新→旧**（git log 序）
 ```
 
 **edge 与 parentIds 的映射规则**（视图层固定）：`continues` → 上一 turn；`forks_from` / `returns_to` / `draws_from` → target turn（多条 = 多 parent）；`concludes` → 该 thread 最后一个 turn（画合流线）。
+视图层另补两条**隐式** parent，使分身漏发边时 lane 不至于碎成孤点：① 同一 thread 内的上一个 turn 恒为第一 parent；② thread 的首个 turn 接到它的 `forkedFromTurnRef`。自指、以及指向未来的 parent 一律滤掉。
+`layoutThreadGraphLanes` 移植自 cline-kanban `buildGraph`，但**不导出 `convergingLanes`**：该实现每行末尾会对泳道去重，因此任何时刻都不会有两条泳道等同一个 id，那个字段恒为空。
 
 ## A.4 Schema（zod，`exploration-thread-graph-schema.ts`；`EXPLORATION_THREAD_GRAPH_SCHEMA_VERSION = 1`）
 
@@ -174,13 +183,13 @@ layoutThreadGraphLanes(rows: { id: string; parentIds: string[] }[]) → ThreadGr
 explorationTurnRef = { conversationSessionId, turnNumber, turnCheckpointCommit: string|null }
 explorationTopic   = { topicId, topicTitle(≤80), topicAliases: string[](≤8), topicSummaryMarkdown(≤400|null),
                        supersededByTopicId: string|null, generationSource: "work_branch_maintenance_job"|"user_manual_edit", createdAt, updatedAt }
-explorationThread  = { threadId: `thread-<n>`, parentThreadId: string|null, forkedFromTurnRef: explorationTurnRef|null,
+explorationThread  = { threadId: `thread-<n>`, threadTitle(≤80), parentThreadId: string|null, forkedFromTurnRef: explorationTurnRef|null,
                        primaryTopicId, threadLifecycleStatus: "active"|"concluded"|"parked"|"abandoned",
                        concludedAtTurnRef: explorationTurnRef|null, generationSource, createdAt, updatedAt }
 turnThreadPlacement = { turnRef, threadId, placementConfidence: "high"|"low", deviationRationale: string|null, placementSource, createdAt, updatedAt }
-turnSubjectTagging  = { turnRef, turnSubjectTags: string[](≤8, 规范化去重), taggingSource }
-turnRelationEdge    = { sourceTurnRef, edgeKind: "continues"|"forks_from"|"returns_to"|"draws_from"|"concludes", targetTurnRef|null, targetThreadId|null }
-turnEventMark       = { turnRef, mark: "milestone"|"decision_point"|"open_question"|"finding_candidate", note: string|null, externalReferenceId: string|null }
+turnSubjectTagging  = { turnRef, turnSubjectTags: string[](≤8, 规范化去重), taggingSource, createdAt, updatedAt }
+turnRelationEdge    = { sourceTurnRef, edgeKind: "continues"|"forks_from"|"returns_to"|"draws_from"|"concludes", targetTurnRef|null, targetThreadId|null, generationSource, createdAt }
+turnEventMark       = { turnRef, mark: "milestone"|"decision_point"|"open_question"|"finding_candidate", note: string|null, externalReferenceId: string|null, generationSource, createdAt }
 
 explorationThreadGraphCollection (per explorationId) = {
   schemaVersion, explorationId,
@@ -191,6 +200,9 @@ explorationThreadGraphCollection (per explorationId) = {
   lastMaintenanceJobCompletedAt, lastMaintenanceJobUsage, updatedAt }
 topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 ```
+
+所有 `createdAt` / `updatedAt` 一律 **epoch 毫秒整数**（`CompletedConversationTurn` 的 `startedAt`/`endedAt` 是 harness 原始 ISO 字符串，两者不要混用）。
+边的去重身份 = `source + edgeKind + target`；事件标注的去重身份 = `turnRef + mark`——重跑作业不该长出重复线或重复标注。
 
 文件布局：`<storeRoot>/topic-registry.json`、`<storeRoot>/explorations/<explorationId>/exploration-thread-graph.json`。宿主传 `storeRoot`（cline-kanban 传 `~/.cline/kanban/workspaces/<ws>/agent-conversation-exploration-thread-graph/`；裸 CLI 默认 `~/.agent-conversation-exploration-thread-graph/`）。
 
@@ -212,7 +224,16 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 
 **transcript 投影**（`claude-code-transcript-completed-turn-source.ts`）：文件 `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`，实时追加。按字节偏移增量读，偏移只推进到完整换行；签名 `{mtimeMs}:{size}:{offset}`；size 变小则从头重解析。记录判别（`claude-code-transcript-record-classifier.ts`）：`type:"user"` 且 content 为字符串或含 text block、非 `isSidechain`、非 `isMeta`、非 tool_result-only → 用户 turn 边界；`promptSource` / `origin` 标识 harness 注入 → `harness_injected`，不开新 turn；`type:"assistant"` 的 text block 累积为回答摘录（最后一段 ≤400）；末 turn 若无后继用户消息且宿主未报 Stop → `inProgressTurnNumber`。先用真实文件核对字段（本机 `~/.claude/projects/` 下即有），fixture 脱敏后入 `test/fixtures/`。移植 cline-kanban `src/agent-session-history/bounded-agent-transcript-reader.ts`（`readBoundedJsonLines` / `splitCompleteJsonLines`）与 `pending-user-decision-transcript-salvage.ts` 的活体 tail 思路；turn 边界分类的先例在 cline-kanban `src/conversation-tree/conversation-turn-projection.ts`（`classifyConversationTurnBoundaryMessage`）。
 
-**fork 执行器**（`claude-code-forked-session-work-branch-executor.ts`）：spawn `claude -p --resume <nativeSessionId> --fork-session --session-id <本包生成 uuid> --output-format json --json-schema <schema JSON> --model <template.model> [--append-system-prompt <template.appendSystemPrompt>] [--settings <template.settingsPath>] <extraArgs>`，cwd = `workingDirectory`，env 加 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`（宿主 hooks 据此整体短路 + PreToolUse deny；无宿主时无害）。**绝不**给 `--bare` / `--safe-mode`（会绕过 hooks）。stdout JSON → `structured`（字段名以 `claude --help` 与一次真实调用为准，疑为 `structured_output`）、`usage.cache_read_input_tokens`、`session_id`。同 model / 同 append-system-prompt / 同 settings 是 cache 命中的前提，模板由宿主逐字提供。本机 Claude Code CLI 2.1.266 已确认存在 `--fork-session`（与 `--resume` 配合生成新 session id）、`--json-schema <schema>`（"JSON Schema for structured output validation"）、`--output-format`（仅 `--print`）。
+**fork 执行器**（`claude-code-forked-session-work-branch-executor.ts`）：spawn `claude -p --resume <nativeSessionId> --fork-session --session-id <本包生成 uuid> --output-format json --json-schema <schema JSON> --model <template.model> [--append-system-prompt <template.appendSystemPrompt>] [--settings <template.settingsPath>] <extraArgs>`，cwd = `workingDirectory`，env 加 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`（宿主 hooks 据此整体短路 + PreToolUse deny；无宿主时无害）。**绝不**给 `--bare` / `--safe-mode`（会绕过 hooks）。stdout JSON → `structured`（**实测确认**字段名就是 `structured_output`）、`usage.cache_read_input_tokens`、`session_id`。
+
+**env 必须洗净（R1 实测新增的硬要求）**：作业往往由宿主会话内的 hook 触发，宿主 Claude Code 会往 env 里注入一批内部变量，其中 `CLAUDE_CODE_CHILD_SESSION=1` 会让分身**完全不落盘 transcript**（终端告警 `Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker`），`forkedNativeSessionId` 的审计价值随之归零。执行器必须删掉 `INHERITED_HOST_CLAUDE_CODE_ENV_VARIABLE_NAMES` 里的全部变量：`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_MESSAGING_SOCKET` / `CLAUDE_CODE_MESSAGING_TOKEN` / `CLAUDE_CODE_ENTRYPOINT` / `CLAUDE_PID` / `CLAUDE_EFFORT` / `CLAUDECODE`。
+
+**prompt cache 的实测真相（2026-09-10，Claude Code 2.1.266）**：
+- `--fork-session` **拿不到**交互式主会话的对话 cache。实测本机真实 kanban 会话（opus，220k）：`cache_read = 0`、`cache_creation = 213,650`、单次 $2.20；去掉 `--json-schema` 后 $2.38，依旧 0。
+- 成因是 Anthropic 已确认的 open bug [#77306](https://github.com/anthropics/claude-code/issues/77306)（2026-07-13 开，2026-08-17 官方复现并确认是 2026-06 下旬 scratchpad-directory 特性引入的 regression）：新 session id 被嵌进 system prompt 的 scratchpad 路径，前缀在 system 层就 byte 不一致。**无 workaround，无 ETA**；CHANGELOG 到 2.1.266 全文未出现 `scratchpad`。
+- 轻量会话上 fork **能**命中（受控 TUI 会话 sonnet ~102k：首次 fork read 85,698/84%，再次 100%）——scratchpad 段由 statsig flag 门控，并非每个会话都注入，所以别用轻量复现去推翻重型会话的结论。
+- **`--append-system-prompt` 在 `--resume` 时不参与**：实测差一个字节、乃至完全不传，命中率都不变。所以「宿主模板逐字回传」**不是** Claude Code 上的 cache 命中前提（仍照传，因为它决定分身的行为，且 dsh 侧仍需要）。
+- 决策：仍按 D5 原样 fork 主会话 + 同 model，接受全价；dsh 的 fork-in-process 不受此 bug 影响（第三方实测 574,953 read / 345 create），设计方向不改。成本靠 `minimumTurnsBetweenMaintenanceRuns` 稀释。本机 Claude Code CLI 2.1.266 已确认存在 `--fork-session`（与 `--resume` 配合生成新 session id）、`--json-schema <schema>`（"JSON Schema for structured output validation"）、`--output-format`（仅 `--print`）。
 
 **Codex**（R3 可选，`harness-codex/`）：rollout `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`；`codex exec resume <sid> [PROMPT] --json -o <file>`。**先核**是否写回同一 rollout（污染主会话）；若污染则该 harness 只提供 turn 来源，执行器回落为「transcript 摘录喂全新 `claude -p`」（无 cache）。
 
@@ -260,16 +281,21 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 
 ## A.12 里程碑
 
-R0 脚手架（**已完成**：package/exports/prepare/biome/vitest/AGENTS/CONTEXT/README/CHANGELOG；`npm run check` 绿）→ R1 core（schema/store/漏斗/视图/布局 + 单测）→ R2 claude harness（投影 + 执行器 + fixture）→ R3 作业 + CLI（先实测 cache 命中）→ R4 dsh smoke → tag v0.1.0。R3 内 Codex 可选。执行顺序自行拓扑排序，不要为「先做哪个」问用户。
+R0 脚手架（**已完成**）→ R1 core（**已完成**）→ R2 claude harness（**已完成**）→ R3 作业 + CLI（**已完成**）→ R4 dsh smoke（**已完成**）；`npm run check` 绿，69 单测 + 1 opt-in 集成。原文后续：→ R2 claude harness（投影 + 执行器 + fixture）→ R3 作业 + CLI（先实测 cache 命中）→ R4 dsh smoke → tag v0.1.0。R3 内 Codex 可选。执行顺序自行拓扑排序，不要为「先做哪个」问用户。
 
 ## A.13 与 cline-kanban 的契约（两个 pass 的共享真相）
 
 1. cline-kanban 依赖 `github:RealmX1/agent-conversation-exploration-thread-graph#<sha>`，`import` 子路径 `/core` 与 `/harness-claude-code`；web-ui 只 import `/core` 的**类型与纯函数**（projection view 类型、`layoutThreadGraphLanes`）。
 2. cline-kanban 提供：`explorationId = workspaceTaskId`；`sessions[]`（主会话在前；每条含 `nativeSessionId` / `transcriptPath` / `workingDirectory` / `launchArgvTemplate{model, appendSystemPrompt, settingsPath, extraArgs}` / by-the-way 的 `forkedFromParentSessionTurnNumber`）；`storeRoot`；触发时机（Stop 边沿 + 防抖 + 每 exploration 并发 1）。
-3. 本包保证：作业 fork 进程 env 含 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`；作业不写宿主任何文件，只写 `storeRoot`；所有写入经漏斗；`ForkedWorkBranchResult.usage` 回报 cache 读量。
+   注（R1 实测修正）：`launchArgvTemplate` 仍**原样回传**，但它在 Claude Code 上**不再是 cache 命中的前提**——`--append-system-prompt` 在 `--resume` 时根本不参与，且 fork 因 [#77306](https://github.com/anthropics/claude-code/issues/77306) 恒不命中主会话 cache（详见 A.6）。逐字回传的理由变成「决定分身行为」与「dsh 侧仍需要」，宿主侧无需为此改动。
+3. 本包保证：作业 fork 进程 env 含 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`，并**删掉宿主注入的 `CLAUDE_CODE_*` / `CLAUDECODE` 内部变量**（见 A.6，否则分身不落盘 transcript）；作业不写宿主任何文件，只写 `storeRoot`；所有写入经漏斗；`ForkedWorkBranchResult.usage` 回报 cache 读量。
 4. 变更协议：改 schema 必 bump `EXPLORATION_THREAD_GRAPH_SCHEMA_VERSION` 并在 `CHANGELOG.md` 记；cline-kanban 升级 = 换 SHA。
 
 ## A.14 假设与风险（接手时知道即可）
 
 - 假设：修订窗口 k=3；fork 用 `--session-id` 固定并登记，jsonl 不删；fork 与主会话同 model（吃 cache），提供「便宜模型不吃 cache」配置；不发布 npm；Codex harness 副作用核实后再定。
-- 风险：cache 命中率（5 分钟 TTL、代理透传、参数逐字一致）；`--json-schema` 输出字段名（不成立则退回「prompt 要求纯 JSON + zod 校验」）；dsh 漂移（peer 钉 rc，smoke 不进主路径）；transcript 格式漂移（解析失败降级为 unavailable + 置信度标注，不炸）；成本（cache read 亦计费，200k 上下文 × 每 turn 一次 ≈ $0.3/turn；opt-in + 旋钮）。
+- 风险（R1 实测后更新）：
+  - ~~cache 命中率~~ → **已定性：Claude Code 上恒不命中**（#77306，无 ETA）。代理透传与账号轮换都已排除（ccflare 单账号 session 策略、cache 头正常透传）。
+  - `--json-schema` 输出字段名 → **已确认为 `structured_output`**；退路（prompt 要求纯 JSON + zod 校验）也实测可用，不传 schema 时模型照样回干净 JSON。
+  - **成本：实测 $2.2–$2.4/次 @220k 上下文**（原估 $0.3 偏乐观约 8 倍），且随上下文线性增长。opt-in + `minimumTurnsBetweenMaintenanceRuns` 是唯一缓解手段，宿主侧默认值要保守。
+  - dsh 漂移（peer 钉 rc，smoke 不进主路径）；transcript 格式漂移（解析失败降级为 unavailable + 置信度标注，不炸）。

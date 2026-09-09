@@ -30,11 +30,12 @@ describe("package 入口点 smoke", () => {
 		expect(DSH_EXPLORATION_THREAD_GRAPH_PROJECTION_KEY).toBe("explorationThreadGraph");
 	});
 
-	it("CLI 无参数输出用法、未知子命令 exit 2", () => {
-		expect(runAgentConversationExplorationThreadGraphCli([]).exitCode).toBe(0);
-		expect(runAgentConversationExplorationThreadGraphCli(["nope"]).exitCode).toBe(2);
+	it("CLI 无参数输出用法、未知子命令 exit 2", async () => {
+		expect((await runAgentConversationExplorationThreadGraphCli([])).exitCode).toBe(0);
+		expect((await runAgentConversationExplorationThreadGraphCli(["nope"])).exitCode).toBe(2);
+		const usageOutput = (await runAgentConversationExplorationThreadGraphCli([])).output;
 		for (const name of AGENT_CONVERSATION_EXPLORATION_THREAD_GRAPH_CLI_SUBCOMMAND_NAMES) {
-			expect(runAgentConversationExplorationThreadGraphCli([]).output).toContain(name);
+			expect(usageOutput).toContain(name);
 		}
 	});
 
