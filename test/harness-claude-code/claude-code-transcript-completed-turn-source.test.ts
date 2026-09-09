@@ -162,5 +162,79 @@ describe("transcript 增量投影", () => {
 		expect(result.completeLines).toEqual(['{"a":1}', '{"b":2}']);
 		expect(result.nextByteOffset).toBe(16);
 		expect(result.fileWasTruncated).toBe(false);
+		expect(result.appendedBytesRemainBeyondIncrementalReadBudget).toBe(false);
+	});
+
+	it("超单次预算时读取窗口从当前 offset 向后截短，绝不跳到文件尾", async () => {
+		await truncate(transcriptPath, 0);
+		await writeFile(transcriptPath, '{"a":1}\n{"b":2}\n{"c":3}\n', "utf8");
+		// 预算 10 字节：只够第一行（8 字节）+ 第二行的一部分。
+		const firstRead = await readAppendedCompleteJsonLines(transcriptPath, 0, 10);
+		expect(firstRead.completeLines).toEqual(['{"a":1}']);
+		expect(firstRead.nextByteOffset).toBe(8);
+		expect(firstRead.appendedBytesRemainBeyondIncrementalReadBudget).toBe(true);
+
+		const secondRead = await readAppendedCompleteJsonLines(transcriptPath, firstRead.nextByteOffset, 10);
+		expect(secondRead.completeLines).toEqual(['{"b":2}']);
+		expect(secondRead.nextByteOffset).toBe(16);
+		expect(secondRead.appendedBytesRemainBeyondIncrementalReadBudget).toBe(true);
+
+		const thirdRead = await readAppendedCompleteJsonLines(transcriptPath, secondRead.nextByteOffset, 10);
+		expect(thirdRead.completeLines).toEqual(['{"c":3}']);
+		expect(thirdRead.nextByteOffset).toBe(24);
+		expect(thirdRead.appendedBytesRemainBeyondIncrementalReadBudget).toBe(false);
+	});
+
+	it("单次预算小于文件时分块读到追平，turn 编号不从文件中段重编", async () => {
+		// fixture 3593 字节；预算 512 字节 = 必须分七八块才能吃完整份。
+		const source = new ClaudeCodeTranscriptCompletedTurnSource({
+			treatFinalTurnAsCompleted: true,
+			maxIncrementalReadBytes: 512,
+		});
+		const budgetedSnapshot = await source.readCompletedTurnSequence(buildSessionRef());
+		expect(budgetedSnapshot.turns.map((turn) => turn.turnNumber)).toEqual([1, 2, 3]);
+		expect(budgetedSnapshot.turns[0]?.userPromptExcerpt).toBe("帮我看看缓存命中的问题");
+		expect(budgetedSnapshot.turns[0]?.toolCallCount).toBe(2);
+
+		// 与不设预算的整份读取逐字段一致：分块只是读法，不改投影。
+		const unboundedSnapshot = await new ClaudeCodeTranscriptCompletedTurnSource({
+			treatFinalTurnAsCompleted: true,
+		}).readCompletedTurnSequence(buildSessionRef());
+		expect(budgetedSnapshot).toEqual(unboundedSnapshot);
+	});
+
+	it("分块追平后继续增量追加，turn 编号仍单调", async () => {
+		const source = new ClaudeCodeTranscriptCompletedTurnSource({
+			treatFinalTurnAsCompleted: true,
+			maxIncrementalReadBytes: 512,
+		});
+		expect((await source.readCompletedTurnSequence(buildSessionRef())).turns).toHaveLength(3);
+
+		await appendFile(
+			transcriptPath,
+			`${JSON.stringify({
+				type: "user",
+				uuid: "u-006",
+				sessionId: "session-fixture",
+				timestamp: "2026-09-01T10:03:00.000Z",
+				isSidechain: false,
+				promptSource: "typed",
+				message: { role: "user", content: "预算追平之后再来一个 turn" },
+			})}\n`,
+			"utf8",
+		);
+		const secondSnapshot = await source.readCompletedTurnSequence(buildSessionRef());
+		expect(secondSnapshot.turns.map((turn) => turn.turnNumber)).toEqual([1, 2, 3, 4]);
+		expect(secondSnapshot.turns[3]?.userPromptExcerpt).toBe("预算追平之后再来一个 turn");
+	});
+
+	it("单行长过预算导致 offset 推不动时降级为空快照，而不是跳过那一行", async () => {
+		const source = new ClaudeCodeTranscriptCompletedTurnSource({
+			treatFinalTurnAsCompleted: true,
+			maxIncrementalReadBytes: 64,
+		});
+		const snapshot = await source.readCompletedTurnSequence(buildSessionRef());
+		expect(snapshot.turns).toEqual([]);
+		expect(snapshot.sourceSignature).toBe("unavailable");
 	});
 });

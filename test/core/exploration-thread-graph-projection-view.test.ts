@@ -80,6 +80,42 @@ describe("projection view", () => {
 		expect(view.laneCount).toBeGreaterThanOrEqual(1);
 	});
 
+	it("分叉锚点指向未来时被丢弃，parent 只向过去", () => {
+		// thread-2 的首个 turn 是 #1，但它的分叉锚点被写成了更晚的 #3：
+		// 派生层必须像显式边那样丢掉这个指向未来的 parent，而不是照单全收。
+		const snapshot = buildCompletedTurnSequenceSnapshot(MAIN_SESSION_ID, 3);
+		const view = buildExplorationThreadGraphProjectionView(
+			buildCollection("exploration-1", {
+				threads: [
+					buildThread("thread-1"),
+					buildThread("thread-2", {
+						parentThreadId: "thread-1",
+						forkedFromTurnRef: buildTurnRef(MAIN_SESSION_ID, 3),
+					}),
+				],
+				turnThreadPlacements: [
+					buildPlacement(MAIN_SESSION_ID, 1, "thread-2"),
+					buildPlacement(MAIN_SESSION_ID, 2, "thread-1"),
+					buildPlacement(MAIN_SESSION_ID, 3, "thread-1"),
+				],
+			}),
+			buildTurnSnapshotsBySession([snapshot]),
+			buildTopicRegistry([buildTopic("topic-1", "起点")]),
+		);
+		const parentsByRowId = new Map(view.turnRows.map((row) => [row.turnRowId, row.parentTurnRowIds]));
+		expect(parentsByRowId.get(`${MAIN_SESSION_ID}#1`)).toEqual([]);
+		// 全图不得出现任何指向更晚行的 parent。
+		const chronologicalIndexByRowId = new Map(
+			[...view.turnRows].reverse().map((row, index) => [row.turnRowId, index]),
+		);
+		for (const row of view.turnRows) {
+			const ownIndex = chronologicalIndexByRowId.get(row.turnRowId) ?? -1;
+			for (const parentTurnRowId of row.parentTurnRowIds) {
+				expect(chronologicalIndexByRowId.get(parentTurnRowId) ?? -1).toBeLessThan(ownIndex);
+			}
+		}
+	});
+
 	it("concludes 边落到目标 thread 的最后一个 turn，形成合流线", () => {
 		const snapshot = buildCompletedTurnSequenceSnapshot(MAIN_SESSION_ID, 4);
 		const view = buildExplorationThreadGraphProjectionView(

@@ -104,6 +104,28 @@ function selectTurnsUnderJudgement(
 	return selected;
 }
 
+/**
+ * 读一遍各会话的已完成 turn 序列，并保留「哪个 sessionRef 读出了哪份快照」的配对。
+ * 作业**读两次**：发起时用来组 prompt 与选待判范围，落盘前在 store 的写锁内重读一次，
+ * 交给闸 2 与发起时的签名对账。
+ */
+async function readTurnSnapshotsPairedWithSessionRefs(
+	sessions: readonly ConversationSessionRef[],
+	turnSource: CompletedTurnSequenceSource,
+): Promise<{ sessionRef: ConversationSessionRef; snapshot: CompletedTurnSequenceSnapshot }[]> {
+	const pairs: { sessionRef: ConversationSessionRef; snapshot: CompletedTurnSequenceSnapshot }[] = [];
+	for (const sessionRef of sessions) {
+		pairs.push({ sessionRef, snapshot: await turnSource.readCompletedTurnSequence(sessionRef) });
+	}
+	return pairs;
+}
+
+function buildTurnSnapshotsBySessionFromPairs(
+	pairs: readonly { snapshot: CompletedTurnSequenceSnapshot }[],
+): Map<string, CompletedTurnSequenceSnapshot> {
+	return new Map(pairs.map(({ snapshot }) => [snapshot.conversationSessionId, snapshot]));
+}
+
 export async function runExplorationThreadGraphMaintenanceJob(
 	input: RunExplorationThreadGraphMaintenanceJobInput,
 ): Promise<RunExplorationThreadGraphMaintenanceJobResult> {
@@ -115,17 +137,21 @@ export async function runExplorationThreadGraphMaintenanceJob(
 	const revisionWindowTurnCount = input.revisionWindowTurnCount ?? DEFAULT_PLACEMENT_REVISION_WINDOW_TURN_COUNT;
 	const batchSize = input.batchSize ?? DEFAULT_MAINTENANCE_JOB_BATCH_SIZE;
 
-	// 1. 读各会话的 turn 快照。
-	const turnSnapshotsBySession = new Map<string, CompletedTurnSequenceSnapshot>();
+	// 1. 读各会话的 turn 快照（作业发起时的现状，只用来组 prompt 与选待判范围）。
+	const turnSnapshotPairsAtJobStart = await readTurnSnapshotsPairedWithSessionRefs(input.sessions, input.turnSource);
+	const turnSnapshotsBySession = buildTurnSnapshotsBySessionFromPairs(turnSnapshotPairsAtJobStart);
 	const forkedFromParentSessionTurnNumberBySession: Record<string, number> = {};
-	for (const sessionRef of input.sessions) {
-		const snapshot = await input.turnSource.readCompletedTurnSequence(sessionRef);
-		turnSnapshotsBySession.set(snapshot.conversationSessionId, snapshot);
+	for (const { sessionRef, snapshot } of turnSnapshotPairsAtJobStart) {
 		if (sessionRef.forkedFromParentSessionTurnNumber !== undefined) {
 			forkedFromParentSessionTurnNumberBySession[snapshot.conversationSessionId] =
 				sessionRef.forkedFromParentSessionTurnNumber;
 		}
 	}
+	// 闸 2 的对账基准：**发起时**读到的签名。它必须单独留存，绝不能在落盘前被重读的结果覆盖，
+	// 否则就是拿同一次读取的签名自比，对账形同虚设。
+	const proposalSourceTurnSequenceSignatureBySession = Object.fromEntries(
+		[...turnSnapshotsBySession].map(([sessionId, snapshot]) => [sessionId, snapshot.sourceSignature]),
+	);
 
 	// 2. 读现状并算待判范围。这里读一次只为组 prompt；落盘时会在锁内**重读**并对账。
 	const currentCollection = await readExplorationThreadGraphCollection(input.storeRoot, input.explorationId, now);
@@ -175,22 +201,25 @@ export async function runExplorationThreadGraphMaintenanceJob(
 		};
 	}
 
-	// 4. 经漏斗落盘。签名对账用的是**作业发起时**读到的签名，作业期间来了新 turn 就会被闸 8 拦下。
-	const proposalSourceTurnSequenceSignatureBySession = Object.fromEntries(
-		[...turnSnapshotsBySession].map(([sessionId, snapshot]) => [sessionId, snapshot.sourceSignature]),
-	);
+	// 4. 经漏斗落盘。fork 可能跑了几分钟，期间用户完全可能又聊了几轮，所以在 store 的写锁内
+	//    **重读** turn 序列，再拿「落盘时刻的新快照 + 发起时的旧签名」交给闸 2 对账——
+	//    重读与对账、落装同在一把 storeRoot 队列锁内，中间不会再被新 turn 穿插。
 	let applyRejectionReason: ExplorationThreadGraphApplyRejectionReason | null = null;
 	let placedTurnCount = 0;
 
 	await mutateExplorationThreadGraph(
 		input.storeRoot,
 		input.explorationId,
-		(snapshot) => {
+		async (snapshot) => {
+			const turnSnapshotsBySessionAtApplyTime = buildTurnSnapshotsBySessionFromPairs(
+				await readTurnSnapshotsPairedWithSessionRefs(input.sessions, input.turnSource),
+			);
 			const applyResult = applyExplorationThreadGraphMaintenanceProposal({
 				explorationId: input.explorationId,
 				proposal: forkResult.structured,
-				turnSnapshotsBySession,
+				turnSnapshotsBySession: turnSnapshotsBySessionAtApplyTime,
 				proposalSourceTurnSequenceSignatureBySession,
+				turnsUnderJudgement,
 				currentCollection: snapshot.collection,
 				currentTopicRegistry: snapshot.topicRegistry,
 				revisionWindowTurnCount,

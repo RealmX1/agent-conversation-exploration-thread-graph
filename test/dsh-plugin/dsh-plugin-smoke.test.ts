@@ -112,6 +112,16 @@ describe("dsh 会话日志 fold", () => {
 		expect(classifyDshUserMessageOrigin("agent-inject")).toBe("harness_injected");
 		expect(classifyDshUserMessageOrigin("cron-notification")).toBe("harness_injected");
 	});
+
+	it("注入判别只认前缀：注入词出现在词中间的人类来源不被误判", () => {
+		// 子串匹配会把这些人类来源当成注入，方向与本模块「认不出来按人类输入处理」的安全偏向相反。
+		expect(classifyDshUserMessageOrigin("noninject")).toBe("human_typed");
+		expect(classifyDshUserMessageOrigin("user-skill-request")).toBe("human_typed");
+		expect(classifyDshUserMessageOrigin("ask-about-cron")).toBe("human_typed");
+		// 前缀命中的仍要认出来。
+		expect(classifyDshUserMessageOrigin("Skill")).toBe("harness_injected");
+		expect(classifyDshUserMessageOrigin("injected-context")).toBe("harness_injected");
+	});
 });
 
 describe("dsh subagent 执行器", () => {
@@ -154,6 +164,40 @@ describe("dsh subagent 执行器", () => {
 		};
 		const result = await new DshSubagentForkedWorkBranchExecutor(subagents).start(buildRequest());
 		expect(result.stopReason).toBe("error");
+	});
+
+	it("provider 永不 settle 时按 timeoutMs 兜底回 timeout，并向 provider 发取消信号", async () => {
+		let observedAbortSignal: AbortSignal | undefined;
+		const subagents: DshSubagentRegistry = {
+			start(request) {
+				observedAbortSignal = request.signal;
+				return new Promise<never>(() => {});
+			},
+		};
+		const result = await new DshSubagentForkedWorkBranchExecutor(subagents).start({
+			...buildRequest(),
+			timeoutMs: 5,
+		});
+		expect(result.stopReason).toBe("timeout");
+		expect(observedAbortSignal?.aborted).toBe(true);
+	});
+
+	it("调用方的取消信号照样传到 provider", async () => {
+		const callerAbortController = new AbortController();
+		let observedAbortSignal: AbortSignal | undefined;
+		const subagents: DshSubagentRegistry = {
+			async start(request) {
+				observedAbortSignal = request.signal;
+				callerAbortController.abort();
+				return { stopReason: "cancelled", output: "" };
+			},
+		};
+		const result = await new DshSubagentForkedWorkBranchExecutor(subagents).start({
+			...buildRequest(),
+			signal: callerAbortController.signal,
+		});
+		expect(result.stopReason).toBe("cancelled");
+		expect(observedAbortSignal?.aborted).toBe(true);
 	});
 
 	it("非 dsh 会话直接拒绝", async () => {

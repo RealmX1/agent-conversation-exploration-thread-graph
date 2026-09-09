@@ -9,7 +9,7 @@
 
 ## 状态
 
-R0–R4 全部落地，`npm run check` 全绿（69 个单测 + 1 个 opt-in 集成测试）：核心 schema / store / apply 漏斗 / projection view / lane 布局、Claude Code harness（transcript 增量投影 + fork 执行器）、维护作业与 CLI、dsh 插件 smoke。
+R0–R4 全部落地，`npm run check` 全绿（108 个单测 + 1 个 opt-in 集成测试）：核心 schema / store / apply 漏斗 / projection view / lane 布局、Claude Code harness（transcript 增量投影 + fork 执行器）、维护作业与 CLI、dsh 插件 smoke。
 
 ## 三层架构（依赖方向单向）
 
@@ -70,26 +70,42 @@ npm run build     # tsc -p tsconfig.build.json → dist/
 在 `~/.claude/settings.json` 里给 Stop hook 挂一条命令。`--final-turn-completed` 是关键：
 Stop 边沿意味着末 turn 已经结束，不给这个开关的话末 turn 会被当成「进行中」而不参与判定。
 
+`--session` 的 JSON 里，`transcriptPath` / `workingDirectory` **必须是绝对路径**：单引号内 shell 不展开 `~`，
+Node 的 `fs` 也不做 tilde 展开，所以写成 `~/.claude/projects/...` 会让 transcript 被判为 `unavailable`——
+不会报错，只会静默产出空图。下面用**不加引号**的 heredoc 先把 `$HOME` 展开成绝对路径再喂给 `--session`。
+
 ```bash
+SESSION_JSON=$(cat <<JSON
+{"harnessKind":"claude_code","nativeSessionId":"<session id>","transcriptPath":"$HOME/.claude/projects/<encoded-cwd>/<session id>.jsonl","workingDirectory":"<repo 绝对路径>","launchArgvTemplate":{"model":"default","appendSystemPrompt":null,"settingsPath":null,"extraArgs":[]}}
+JSON
+)
+
 agent-conversation-exploration-thread-graph maintain \
 	--exploration-id <根会话 session id> \
-	--store-root ~/.agent-conversation-exploration-thread-graph \
-	--session '{"harnessKind":"claude_code","nativeSessionId":"<session id>","transcriptPath":"~/.claude/projects/<encoded-cwd>/<session id>.jsonl","workingDirectory":"<repo>","launchArgvTemplate":{"model":"default","appendSystemPrompt":null,"settingsPath":null,"extraArgs":[]}}' \
+	--store-root "$HOME/.agent-conversation-exploration-thread-graph" \
+	--session "$SESSION_JSON" \
 	--mode incremental --final-turn-completed
 ```
 
-读回来：
+配好后先跑一次 `doctor` 确认 `transcriptIsReadable` 为 `true`，再挂上 Stop hook——
+这是唯一能把「路径写错」和「本来就没有新 turn」区分开的地方。
+
+读回来（沿用上面的 `$SESSION_JSON`）：
 
 ```bash
 # 落盘的 collection
-agent-conversation-exploration-thread-graph get --exploration-id <id> --store-root <dir>
+agent-conversation-exploration-thread-graph get --exploration-id <id> --store-root "$HOME/.agent-conversation-exploration-thread-graph"
 # 给宿主渲染的 projection 整值（需要 --session 才能摊出 turn 行）
-agent-conversation-exploration-thread-graph get --exploration-id <id> --store-root <dir> --view --session '<json>'
+agent-conversation-exploration-thread-graph get --exploration-id <id> --store-root "$HOME/.agent-conversation-exploration-thread-graph" --view --session "$SESSION_JSON"
 # 分身要满足的 JSON Schema（调试用）
 agent-conversation-exploration-thread-graph schema
-# 体检：transcript 可读、fork 参数模板完整、没有会绕过 hooks 的参数
-agent-conversation-exploration-thread-graph doctor --session '<json>'
+# 体检：transcript 可读、`claude` 可执行、fork 参数模板完整、没有会绕过 hooks 的参数
+agent-conversation-exploration-thread-graph doctor --session "$SESSION_JSON"
 ```
+
+多个进程（多个 Stop hook 触发的 CLI、或宿主进程与 CLI 并存）可以安全地共用同一个 `storeRoot`：
+写路径除了进程内串行队列，还会在 `<storeRoot>/exploration-thread-graph-store-write.lock` 上取一把跨进程锁
+（超 15s 的锁按持有者已死回收；等锁超 20s 报错而不是硬写）。读路径不取锁，永不抛。
 
 首次接入一个已经聊了很久的会话时先跑一次 `--mode initial_backfill`（可用 `--batch-size` 分批），
 之后每个 turn 用 `--mode incremental`。`storeRoot` 省略时默认 `~/.agent-conversation-exploration-thread-graph`。

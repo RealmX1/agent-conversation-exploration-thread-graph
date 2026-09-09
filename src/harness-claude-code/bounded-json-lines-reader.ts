@@ -15,9 +15,22 @@ export interface BoundedJsonLinesReadResult {
 	fileModifiedAtMilliseconds: number;
 	/** 文件变小 = 被重写/截断，调用方必须丢弃已累积的状态从头再来。 */
 	fileWasTruncated: boolean;
+	/**
+	 * 本次读取被单次字节预算截短，`nextByteOffset` 之后**还有已经写完的字节没读**。
+	 *
+	 * 调用方必须带着新的 `nextByteOffset` 继续读到这个标志为 false 才算追平：
+	 * 中途停下就等于漏掉一段记录，而漏掉一条人类输入边界就是 turn 编号永久错位。
+	 */
+	appendedBytesRemainBeyondIncrementalReadBudget: boolean;
 }
 
-/** 单次增量读取的字节上限：挡住「离开一整天回来一次读 200MB」。 */
+/**
+ * **单次** `read(2)` 的缓冲区字节上限：挡住「离开一整天回来一次性分配 200MB Buffer」。
+ *
+ * 它约束的是单次读取的内存峰值，**不是**一次投影的总工作量：超预算时读取窗口从当前 offset
+ * 向后取这么多字节（**绝不跳到文件尾**），调用方分多次把增量吃完。跳字节会让 turn 从文件
+ * 中段重新编号，代价远大于多读几次。
+ */
 export const DEFAULT_MAX_INCREMENTAL_READ_BYTES = 32 * 1024 * 1024;
 
 export async function readAppendedCompleteJsonLines(
@@ -38,15 +51,18 @@ export async function readAppendedCompleteJsonLines(
 			fileSizeBytes,
 			fileModifiedAtMilliseconds,
 			fileWasTruncated,
+			appendedBytesRemainBeyondIncrementalReadBudget: false,
 		};
 	}
 
-	// 超预算时只读尾部，并把 offset 直接跳到读取起点——中间那段就此丢失，
-	// 调用方据 fileWasTruncated / offset 跳变自行决定要不要整份重算。
-	const availableByteCount = fileSizeBytes - startByteOffset;
-	const readStartByteOffset =
-		availableByteCount > maxIncrementalReadBytes ? fileSizeBytes - maxIncrementalReadBytes : startByteOffset;
-	const readByteCount = fileSizeBytes - readStartByteOffset;
+	// 读取窗口的起点**恒为** startByteOffset：超预算时只截短窗口长度，绝不跳过中间字节。
+	// （跳读会让调用方从文件中段把 turn 从 1 重新编号，而 fileWasTruncated 为 false、
+	// 签名照常推进，漏斗的对账闸拦不住。）本次没吃完的部分由
+	// appendedBytesRemainBeyondIncrementalReadBudget 通知调用方继续读。
+	const readStartByteOffset = startByteOffset;
+	const availableByteCount = fileSizeBytes - readStartByteOffset;
+	const readWasLimitedByIncrementalByteBudget = availableByteCount > maxIncrementalReadBytes;
+	const readByteCount = readWasLimitedByIncrementalByteBudget ? maxIncrementalReadBytes : availableByteCount;
 
 	const fileHandle = await open(filePath, "r");
 	let buffer: Buffer;
@@ -58,24 +74,30 @@ export async function readAppendedCompleteJsonLines(
 		await fileHandle.close();
 	}
 
-	// 只认最后一个换行符之前的内容；其后是尚未写完的半行，留给下次。
+	// 只认最后一个换行符之前的内容；其后是尚未写完的半行（或被预算切断的半行），留给下次。
 	const lastNewlineIndex = buffer.lastIndexOf(0x0a);
 	if (lastNewlineIndex < 0) {
+		// 窗口里一个换行都没有：要么末尾就是半行，要么这一行本身长过预算——
+		// 后者 offset 无从推进，调用方靠「读了但 offset 没动」识别并停下，绝不跳过它。
 		return {
 			completeLines: [],
 			nextByteOffset: readStartByteOffset,
 			fileSizeBytes,
 			fileModifiedAtMilliseconds,
 			fileWasTruncated,
+			appendedBytesRemainBeyondIncrementalReadBudget: readWasLimitedByIncrementalByteBudget,
 		};
 	}
 	const completeText = buffer.subarray(0, lastNewlineIndex + 1).toString("utf8");
+	const nextByteOffset = readStartByteOffset + lastNewlineIndex + 1;
 	return {
 		completeLines: completeText.split(/\r?\n/u).filter((line) => line !== ""),
-		nextByteOffset: readStartByteOffset + lastNewlineIndex + 1,
+		nextByteOffset,
 		fileSizeBytes,
 		fileModifiedAtMilliseconds,
 		fileWasTruncated,
+		appendedBytesRemainBeyondIncrementalReadBudget:
+			readWasLimitedByIncrementalByteBudget && nextByteOffset < fileSizeBytes,
 	};
 }
 

@@ -1,6 +1,8 @@
 // 各单测共用的构造器：把「造一份合法快照/集合」的样板集中一处，
 // 免得每个测试各写一份、日后 schema 一改要改十处。
 
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type {
 	CompletedConversationTurn,
 	CompletedTurnSequenceSnapshot,
@@ -153,4 +155,19 @@ export function buildProposal(
 		subjectTaggings: [],
 		...overrides,
 	};
+}
+
+/**
+ * 造一个假的 `claude` 可执行文件，返回它所在的目录（供测试塞进 `process.env.PATH`）。
+ *
+ * doctor 会按 PATH 解析 `claude`（handoff A.7），所以断言「doctor 通过」的用例
+ * 不能指望跑测机器上真的装了 claude——那会让 `npm run check` 的结果随机器而变。
+ */
+export async function createFakeClaudeExecutableDirectory(parentDirectory: string): Promise<string> {
+	const fakeExecutableDirectory = join(parentDirectory, "fake-claude-executable-bin");
+	await mkdir(fakeExecutableDirectory, { recursive: true });
+	const fakeExecutablePath = join(fakeExecutableDirectory, "claude");
+	await writeFile(fakeExecutablePath, "#!/bin/sh\necho 0.0.0-fake\n");
+	await chmod(fakeExecutablePath, 0o755);
+	return fakeExecutableDirectory;
 }

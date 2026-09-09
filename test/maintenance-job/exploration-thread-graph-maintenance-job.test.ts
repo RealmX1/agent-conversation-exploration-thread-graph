@@ -1,7 +1,7 @@
 // 维护作业端到端：真 transcript fixture + 真 store + 真漏斗，只把 fork 执行器换成夹具回放。
 // 这条链覆盖 A.11 的「CLI e2e」：fixture → maintain(initial_backfill) → get --view 断言 lane 与边。
 
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runAgentConversationExplorationThreadGraphCli } from "../../src/cli/agent-conversation-exploration-thread-graph-cli.js";
 import {
 	buildExplorationThreadGraphMaintenanceProposalJsonSchema,
+	type CompletedTurnSequenceSnapshot,
+	type CompletedTurnSequenceSource,
 	type ConversationSessionRef,
 	type ForkedWorkBranchExecutor,
 	type ForkedWorkBranchRequest,
@@ -16,6 +18,7 @@ import {
 	runExplorationThreadGraphMaintenanceJob,
 } from "../../src/core/index.js";
 import { ClaudeCodeTranscriptCompletedTurnSource } from "../../src/harness-claude-code/index.js";
+import { createFakeClaudeExecutableDirectory } from "../fixtures/exploration-thread-graph-test-doubles.js";
 
 const fixtureTranscriptPath = join(
 	dirname(fileURLToPath(import.meta.url)),
@@ -37,6 +40,47 @@ class ReplayingForkedWorkBranchExecutor implements ForkedWorkBranchExecutor {
 			usage: { inputTokens: 12, cacheReadInputTokens: 0, outputTokens: 34, costUsd: 1.23 },
 			forkedNativeSessionId: "forked-session-for-test",
 		};
+	}
+}
+
+/**
+ * 分身跑着的时候用户又聊了一轮：`start()` 在返回提案**之前**往 transcript 追加一个新的人类 turn。
+ * 这正是闸 2 要防的时序——作业的判定基于的快照，在落盘那一刻已经过期。
+ */
+class TranscriptAppendingDuringForkExecutor implements ForkedWorkBranchExecutor {
+	constructor(
+		private readonly structuredProposal: unknown,
+		private readonly transcriptPathToAppend: string,
+	) {}
+	async start(): Promise<ForkedWorkBranchResult> {
+		const newHumanTurnRecord = {
+			type: "user",
+			uuid: "u-appended-during-fork",
+			parentUuid: null,
+			sessionId: "session-fixture",
+			timestamp: "2026-09-01T10:05:00.000Z",
+			isSidechain: false,
+			promptSource: "typed",
+			origin: { kind: "human" },
+			userType: "external",
+			message: { role: "user", content: "作业还没回来我就又问了一句" },
+		};
+		await appendFile(this.transcriptPathToAppend, `${JSON.stringify(newHumanTurnRecord)}\n`, "utf8");
+		return {
+			structured: this.structuredProposal,
+			outputText: JSON.stringify(this.structuredProposal),
+			stopReason: "completed",
+		};
+	}
+}
+
+/** 只做计数的转发来源：用来断言「fork 返回后确实又重读了一次 turnSource」。 */
+class ReadCountingCompletedTurnSource implements CompletedTurnSequenceSource {
+	readCompletedTurnSequenceCallCount = 0;
+	constructor(private readonly delegate: CompletedTurnSequenceSource) {}
+	async readCompletedTurnSequence(sessionRef: ConversationSessionRef): Promise<CompletedTurnSequenceSnapshot> {
+		this.readCompletedTurnSequenceCallCount += 1;
+		return await this.delegate.readCompletedTurnSequence(sessionRef);
 	}
 }
 
@@ -232,6 +276,73 @@ describe("维护作业端到端", () => {
 		expect(secondRun).toMatchObject({ outcome: "skipped", skipReason: "no_turns_under_judgement" });
 	});
 
+	it("分身跑着的时候来了新 turn ⇒ 落盘前重读 turnSource，闸 2 拒绝且只落 stale 标记", async () => {
+		const readCountingTurnSource = new ReadCountingCompletedTurnSource(
+			new ClaudeCodeTranscriptCompletedTurnSource({ treatFinalTurnAsCompleted: true }),
+		);
+		const result = await runExplorationThreadGraphMaintenanceJob({
+			explorationId: "task-1",
+			sessions: [buildSessionRef()],
+			turnSource: readCountingTurnSource,
+			executor: new TranscriptAppendingDuringForkExecutor(buildReplayProposal(), transcriptPath),
+			storeRoot,
+			mode: "initial_backfill",
+		});
+		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "turn_source_signature_mismatch" });
+		// 发起时读一次 + 落盘前在写锁内重读一次；只读一次就说明签名对账是同源自比。
+		expect(readCountingTurnSource.readCompletedTurnSequenceCallCount).toBe(2);
+
+		const cliResult = await runAgentConversationExplorationThreadGraphCli([
+			"get",
+			"--exploration-id",
+			"task-1",
+			"--store-root",
+			storeRoot,
+		]);
+		const parsed = JSON.parse(cliResult.output) as {
+			collection: { threads: unknown[]; turnThreadPlacements: unknown[]; staleReason: string | null };
+		};
+		expect(parsed.collection.threads).toEqual([]);
+		expect(parsed.collection.turnThreadPlacements).toEqual([]);
+		expect(parsed.collection.staleReason).toBe("turn_source_signature_changed");
+	});
+
+	it("分身漏判待判 turn 时整份拒绝，什么都不落盘", async () => {
+		// 待判范围由作业算出并原样交给漏斗；分身交白卷不该被当成一次成功确认。
+		const emptyProposalExecutor = new ReplayingForkedWorkBranchExecutor({
+			placements: [],
+			newThreads: [],
+			topicProposals: [],
+			edges: [],
+			eventMarks: [],
+			threadRevisions: [],
+			subjectTaggings: [],
+		});
+		const result = await runExplorationThreadGraphMaintenanceJob({
+			explorationId: "task-1",
+			sessions: [buildSessionRef()],
+			turnSource: new ClaudeCodeTranscriptCompletedTurnSource({ treatFinalTurnAsCompleted: true }),
+			executor: emptyProposalExecutor,
+			storeRoot,
+			mode: "initial_backfill",
+		});
+		expect(result).toMatchObject({
+			outcome: "rejected",
+			rejectionReason: "placement_missing_for_turn_under_judgement",
+		});
+		const cliResult = await runAgentConversationExplorationThreadGraphCli([
+			"get",
+			"--exploration-id",
+			"task-1",
+			"--store-root",
+			storeRoot,
+		]);
+		expect(
+			(JSON.parse(cliResult.output) as { collection: { turnThreadPlacements: unknown[] } }).collection
+				.turnThreadPlacements,
+		).toEqual([]);
+	});
+
 	it("分身失败时不落盘，如实回报 stopReason", async () => {
 		const failingExecutor: ForkedWorkBranchExecutor = {
 			async start(): Promise<ForkedWorkBranchResult> {
@@ -280,12 +391,20 @@ describe("CLI 其余子命令", () => {
 	});
 
 	it("doctor 对可读 transcript 通过，对缺失 transcript 与被禁参数不通过", async () => {
-		const passing = await runAgentConversationExplorationThreadGraphCli([
-			"doctor",
-			"--session",
-			JSON.stringify(buildSessionRef()),
-		]);
-		expect(passing.exitCode).toBe(0);
+		// doctor 还要探测 `claude` 可执行（handoff A.7），用假可执行文件把 PATH 钉死，
+		// 免得「通过」这一支随跑测机器上装没装 claude 而变。
+		const originalSearchPath = process.env.PATH;
+		process.env.PATH = await createFakeClaudeExecutableDirectory(workspaceDirectory);
+		try {
+			const passing = await runAgentConversationExplorationThreadGraphCli([
+				"doctor",
+				"--session",
+				JSON.stringify(buildSessionRef()),
+			]);
+			expect(passing.exitCode).toBe(0);
+		} finally {
+			process.env.PATH = originalSearchPath;
+		}
 
 		const missingTranscript = await runAgentConversationExplorationThreadGraphCli([
 			"doctor",

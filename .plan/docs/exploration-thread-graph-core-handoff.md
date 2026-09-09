@@ -84,7 +84,7 @@ agent-conversation-exploration-thread-graph/
 │   ├── core/
 │   │   ├── index.ts                                   # 子路径 ./core 入口（R0 只有契约常量）
 │   │   ├── exploration-thread-graph-schema.ts         # zod：A.4 全部实体 + collection + SCHEMA_VERSION
-│   │   ├── exploration-thread-graph-store.ts          # 文件 store（串行写队列/原子写/损坏容错/路径守卫/cap）
+│   │   ├── exploration-thread-graph-store.ts          # 文件 store（进程内写队列 + 跨进程锁/原子写/损坏容错/路径守卫/cap）
 │   │   ├── exploration-thread-graph-apply-funnel.ts   # 唯一写点，A.5 闸序
 │   │   ├── completed-turn-sequence-source.ts          # 接口 + 类型（A.3）
 │   │   ├── forked-work-branch-executor.ts             # 接口 + 类型（A.3）
@@ -162,9 +162,11 @@ type ConversationSessionRef =
 // ── store / 漏斗 / 视图 / 布局（R1 落地后的最终签名）
 readExplorationThreadGraphCollection(storeRoot, explorationId, now?) / readExplorationTopicRegistry(storeRoot)
 mutateExplorationThreadGraph(storeRoot, explorationId, mutator, now?)   // collection 与 topic 注册表同锁落盘；durable-write-before-ack
+                                                                       // mutator 可返回 Promise：调用方得以在写锁内重读外部来源（作业就靠它做闸 8 对账）
 applyExplorationThreadGraphMaintenanceProposal({
   explorationId, proposal /* 未校验，闸 1 在漏斗内做 */, turnSnapshotsBySession,
   proposalSourceTurnSequenceSignatureBySession,   // 作业发起时读到的签名，闸 8 拿它对账
+  turnsUnderJudgement,                            // 本次交给分身判定的 turn 范围，闸 5 拿它校验覆盖
   currentCollection, currentTopicRegistry,        // 漏斗要跨两者派生 id / 复用 topic
   revisionWindowTurnCount?, maintenanceJobUsage?, now,
 }) → { outcome: "accepted"; collection; topicRegistry }
@@ -204,11 +206,11 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 所有 `createdAt` / `updatedAt` 一律 **epoch 毫秒整数**（`CompletedConversationTurn` 的 `startedAt`/`endedAt` 是 harness 原始 ISO 字符串，两者不要混用）。
 边的去重身份 = `source + edgeKind + target`；事件标注的去重身份 = `turnRef + mark`——重跑作业不该长出重复线或重复标注。
 
-文件布局：`<storeRoot>/topic-registry.json`、`<storeRoot>/explorations/<explorationId>/exploration-thread-graph.json`。宿主传 `storeRoot`（cline-kanban 传 `~/.cline/kanban/workspaces/<ws>/agent-conversation-exploration-thread-graph/`；裸 CLI 默认 `~/.agent-conversation-exploration-thread-graph/`）。
+文件布局：`<storeRoot>/topic-registry.json`、`<storeRoot>/explorations/<explorationId>/exploration-thread-graph.json`、`<storeRoot>/exploration-thread-graph-store-write.lock`（跨进程写锁，非图数据，备份时别带走；路径见 `resolveExplorationThreadGraphStoreWriteLockPath`）。**写路径两层互斥**：进程内按 storeRoot 串行的写队列 + 该锁文件（`O_CREAT|O_EXCL`，超 15s 判陈旧并回收，等锁超 20s 抛错）。裸用法每次 Stop hook 都是新的 CLI 进程、宿主进程又可能与 CLI 并存，只有进程内队列会互相整份覆盖。宿主传 `storeRoot`（cline-kanban 传 `~/.cline/kanban/workspaces/<ws>/agent-conversation-exploration-thread-graph/`；裸 CLI 默认 `~/.agent-conversation-exploration-thread-graph/`）。
 
 ## A.5 维护作业与漏斗
 
-**作业输入**：`{ explorationId, sessions: ConversationSessionRef[], turnSource, executor, store, mode: "initial_backfill"|"incremental", revisionWindow: 3, batchSize }`。主会话 = `sessions[0]`（fork 它）；by-the-way 会话的 turn 也在 prompt 里列出，其分叉锚点直接取 `forkedFromParentSessionTurnNumber`，作业只判父级。
+**作业输入**：`{ explorationId, sessions: ConversationSessionRef[], turnSource, executor, store, mode: "initial_backfill"|"incremental", revisionWindow: 3, batchSize }`。**turnSource 读两次**：发起时那次只用来组 prompt 与选待判范围；fork 返回后、落盘前在 store 的写锁内**重读一次**，拿「落盘时刻的新快照 + 发起时留存的旧签名」交给闸 8 对账——只读一次就是同源自比，闸 8 会形同虚设。主会话 = `sessions[0]`（fork 它）；by-the-way 会话的 turn 也在 prompt 里列出，其分叉锚点直接取 `forkedFromParentSessionTurnNumber`，作业只判父级。
 
 **Prompt 组装**（`maintenance-job-prompt-assembly.ts`）：① 角色与目的（你是本会话的分身，只输出 JSON，不执行工具）② 判据文字（偏离定义 + 线索：用户明说换话题 / by-the-way 措辞 / 回到先前某问题 / 新假设展开）③ **turn 对照表**：`turnNumber ↔ 用户消息前 80 字 ↔ 当前 placement（threadId/topic 标题）`，让分身把编号对上自己上下文里的消息 ④ 现有 threads / topics 摘要 ⑤ 待判范围（incremental：frontier 之后 + 修订窗口内；backfill：全部，可分批）⑥ 判断清单（下）⑦ 只输出符合 schema 的 JSON。
 
@@ -216,13 +218,14 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 
 **Proposal schema**（分身输出，`maintenance-job-proposal-schema.ts`）：`{ placements[], newThreads[]（含临时 id → 漏斗派生正式 id）, topicProposals[]（标题/别名/摘要；漏斗按规范化标题撞注册表复用）, edges[], eventMarks[], threadRevisions[]（改题/改状态）, subjectTaggings[] }`。JSON Schema 由 zod 生成（zod v4 `z.toJSONSchema` 或 `zod-to-json-schema`，二选一后钉死；本包 zod 已是 ^4.3，优先 `z.toJSONSchema`）。
 
-**漏斗闸序**（`exploration-thread-graph-apply-funnel.ts`，唯一写点，任一闸失败整体丢弃并回 `rejected(reason)`）：zod 形状 → 每个 turnRef 可解析（在对应会话的 turn 快照内，且不是进行中的末 turn）→ threadId/topicId 可解析（含本 proposal 新建的临时 id）→ 边只向过去（target 早于 source，跨会话按时间）→ 每 turnRef 恰一行 placement → 修订窗口外的既有 placement 不得改动 → `user_manual_edit` 来源的记录不得被作业改动 → 签名对账（`sourceTurnSequenceSignatureBySession` 与作业读到的一致，否则拒绝并标 stale）→ 派生正式 id / 复用 topic → durable-write-before-ack。骨架照抄 cline-kanban `src/state/exploratory-session-map-apply-funnel.ts` 与 `exploratory-session-map-store.ts`（串行写队列/原子写/损坏容错/路径守卫/cap-and-trim），实体换掉即可。
+**漏斗闸序**（`exploration-thread-graph-apply-funnel.ts`，唯一写点，任一闸失败整体丢弃并回 `rejected(reason)`）。**编号即真实执行顺序**——多道闸同时失败时，外部观察到的 `rejectionReason` 就是编号最小的那道：
+① zod 形状 → ② 签名对账（`proposalSourceTurnSequenceSignatureBySession`（作业**发起时**留存的签名）与 `turnSnapshotsBySession`（**落盘时刻在 store 写锁内重读**的快照）一致，否则拒绝并标 stale；排在所有语义闸之前，因为签名对不上意味着判定基于过期快照）→ ③ 每个 turnRef 可解析（在对应会话的 turn 快照内，且不是进行中的末 turn）→ ④ threadId/topicId 可解析（含本 proposal 新建的临时 id；临时 id 既不得与既有 id 撞名，提案内也不得自相重复）→ ⑤ 边只向过去（target 早于 source，跨会话按时间）→ ⑥ placements 恰好覆盖 `turnsUnderJudgement`（每个待判 turn 恰一行，漏判与范围外的 placement 都整份拒绝）→ ⑦ `user_manual_edit` 来源的记录不得被作业改动（与 ⑧ 同一遍遍历、命中时先返回；thread 修订那半需按 topic 维度解析 id，故实际排在 ⑨ 之后执行）→ ⑧ 修订窗口外的既有 placement 不得改动 → ⑨ 派生正式 id / 复用 topic → ⑩ durable-write-before-ack。骨架照抄 cline-kanban `src/state/exploratory-session-map-apply-funnel.ts` 与 `exploratory-session-map-store.ts`（串行写队列/原子写/损坏容错/路径守卫/cap-and-trim），实体换掉即可。
 
 **成本旋钮**：`minimumTurnsBetweenMaintenanceRuns`（上下文超阈值后每 N turn 跑一次）；`useCheaperModelForkWithoutCache`（放弃 cache 换便宜模型）。
 
 ## A.6 Claude Code harness 适配器
 
-**transcript 投影**（`claude-code-transcript-completed-turn-source.ts`）：文件 `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`，实时追加。按字节偏移增量读，偏移只推进到完整换行；签名 `{mtimeMs}:{size}:{offset}`；size 变小则从头重解析。记录判别（`claude-code-transcript-record-classifier.ts`）：`type:"user"` 且 content 为字符串或含 text block、非 `isSidechain`、非 `isMeta`、非 tool_result-only → 用户 turn 边界；`promptSource` / `origin` 标识 harness 注入 → `harness_injected`，不开新 turn；`type:"assistant"` 的 text block 累积为回答摘录（最后一段 ≤400）；末 turn 若无后继用户消息且宿主未报 Stop → `inProgressTurnNumber`。先用真实文件核对字段（本机 `~/.claude/projects/` 下即有），fixture 脱敏后入 `test/fixtures/`。移植 cline-kanban `src/agent-session-history/bounded-agent-transcript-reader.ts`（`readBoundedJsonLines` / `splitCompleteJsonLines`）与 `pending-user-decision-transcript-salvage.ts` 的活体 tail 思路；turn 边界分类的先例在 cline-kanban `src/conversation-tree/conversation-turn-projection.ts`（`classifyConversationTurnBoundaryMessage`）。
+**transcript 投影**（`claude-code-transcript-completed-turn-source.ts`）：文件 `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`，实时追加。按字节偏移增量读，偏移只推进到完整换行；签名 `{mtimeMs}:{size}:{offset}`；size 变小则从头重解析。**单次读取的字节预算只截短读取窗口、绝不跳字节**：增量大过预算时（>32MB 长会话的 `initial_backfill` 就是典型）读取器置 `appendedBytesRemainBeyondIncrementalReadBudget`，投影方分多块读到追平再出快照——跳段会让 turn 从文件中段重新编号，而 `fileWasTruncated` 为 false、签名照常推进，漏斗的对账闸拦不住。单行长过预算导致 offset 推不动时整份降级为 `sourceSignature: "unavailable"` 的空快照，绝不跳过那一行。记录判别（`claude-code-transcript-record-classifier.ts`）：`type:"user"` 且 content 为字符串或含 text block、非 `isSidechain`、非 `isMeta`、非 tool_result-only → 用户 turn 边界；`promptSource` / `origin` 标识 harness 注入 → `harness_injected`，不开新 turn；`type:"assistant"` 的 text block 累积为回答摘录（最后一段 ≤400）；末 turn 若无后继用户消息且宿主未报 Stop → `inProgressTurnNumber`。先用真实文件核对字段（本机 `~/.claude/projects/` 下即有），fixture 脱敏后入 `test/fixtures/`。移植 cline-kanban `src/agent-session-history/bounded-agent-transcript-reader.ts`（`readBoundedJsonLines` / `splitCompleteJsonLines`）与 `pending-user-decision-transcript-salvage.ts` 的活体 tail 思路；turn 边界分类的先例在 cline-kanban `src/conversation-tree/conversation-turn-projection.ts`（`classifyConversationTurnBoundaryMessage`）。
 
 **fork 执行器**（`claude-code-forked-session-work-branch-executor.ts`）：spawn `claude -p --resume <nativeSessionId> --fork-session --session-id <本包生成 uuid> --output-format json --json-schema <schema JSON> --model <template.model> [--append-system-prompt <template.appendSystemPrompt>] [--settings <template.settingsPath>] <extraArgs>`，cwd = `workingDirectory`，env 加 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`（宿主 hooks 据此整体短路 + PreToolUse deny；无宿主时无害）。**绝不**给 `--bare` / `--safe-mode`（会绕过 hooks）。stdout JSON → `structured`（**实测确认**字段名就是 `structured_output`）、`usage.cache_read_input_tokens`、`session_id`。
 

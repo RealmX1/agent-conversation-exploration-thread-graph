@@ -26,6 +26,12 @@ import {
 /** 会绕过宿主 hooks 的参数：出现即拒绝执行（契约 A.13-3 的前提）。 */
 const FORBIDDEN_LAUNCH_ARGUMENTS = ["--bare", "--safe-mode"];
 
+/**
+ * 未指定时 spawn 哪个 `claude`：裸名字，交给 PATH 解析。
+ * CLI `doctor` 探测的必须是**同一个**目标，否则 doctor 报通过而 maintain 在 spawn 处才失败。
+ */
+export const DEFAULT_CLAUDE_EXECUTABLE_PATH = "claude";
+
 export interface ClaudeCodeForkedSessionWorkBranchExecutorOptions {
 	/** `claude` 可执行文件路径；默认走 PATH。 */
 	claudeExecutablePath?: string;
@@ -82,7 +88,7 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 	private readonly overrideModel: string | null;
 
 	constructor(options: ClaudeCodeForkedSessionWorkBranchExecutorOptions = {}) {
-		this.claudeExecutablePath = options.claudeExecutablePath ?? "claude";
+		this.claudeExecutablePath = options.claudeExecutablePath ?? DEFAULT_CLAUDE_EXECUTABLE_PATH;
 		this.overrideModel = options.overrideModel ?? null;
 	}
 

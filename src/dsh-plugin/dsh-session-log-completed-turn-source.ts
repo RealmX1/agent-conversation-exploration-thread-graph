@@ -13,19 +13,33 @@ import { COMPLETED_CONVERSATION_TURN_EXCERPT_MAX_LENGTH } from "../core/index.js
 import type { DshSessionEvent } from "./dsh-session-seam-contracts.js";
 
 /**
- * `user/message.source` 里表示「harness 注入」的取值。
+ * `user/message.source` 里表示「harness 注入」的取值前缀。
  *
  * ⚠️ dsh 处于 developer preview，其 source 词表尚未在公开文档里定死（本地 clone 也查不到枚举）。
  * 这里按文档正文点名的三类注入（`agent.inject()` 的合成上下文、skill 内容、cron 通知）取保守前缀匹配，
  * **认不出来就按人类输入处理**——宁可多开一个 turn 让人看见，也不要静默吞掉一次真实提问。
  * dsh 词表定稿后，改这一个常量即可。
+ *
+ * 匹配语义是 `startsWith` 而**不是**子串包含：子串比前缀宽松，会把 `noninject`、`user-skill-request`
+ * 这类人类来源判成注入，方向与上面的安全偏向正好相反。宁可漏认一个新出现的注入来源（退化成人类输入、
+ * 至多多留一个 turn 的摘录），也不要把真实提问归到注入里。
  */
-export const DSH_HARNESS_INJECTED_USER_MESSAGE_SOURCE_PREFIXES = ["inject", "skill", "cron", "notice", "continuation"];
+export const DSH_HARNESS_INJECTED_USER_MESSAGE_SOURCE_PREFIXES = [
+	"inject",
+	"agent-inject",
+	"agent.inject",
+	"skill",
+	"cron",
+	"notice",
+	"continuation",
+];
 
 export function classifyDshUserMessageOrigin(source: string | undefined): ConversationUserMessageOrigin {
 	if (source === undefined) return "human_typed";
 	const normalizedSource = source.toLowerCase();
-	return DSH_HARNESS_INJECTED_USER_MESSAGE_SOURCE_PREFIXES.some((prefix) => normalizedSource.includes(prefix))
+	return DSH_HARNESS_INJECTED_USER_MESSAGE_SOURCE_PREFIXES.some((injectedSourcePrefix) =>
+		normalizedSource.startsWith(injectedSourcePrefix),
+	)
 		? "harness_injected"
 		: "human_typed";
 }

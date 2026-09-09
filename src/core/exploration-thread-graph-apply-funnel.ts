@@ -2,15 +2,18 @@
 // 纯函数——调用方先把 turn 快照与现状取好，再在 store 的串行写队列里调本函数，
 // 保证「读现状 → 校验 → 落装」与写盘原子于同一把队列锁内。
 //
-// 闸序（任一失败整体丢弃并回 rejected(reason)）：
+// 闸序（任一失败整体丢弃并回 rejected(reason)）。**编号即真实执行顺序**——
+// 多道闸会同时失败时，外部观察到的 rejectionReason 就是编号最小的那道：
 //   1. zod 形状（含尺寸上限）
-//   2. 每个 turnRef 可解析：在对应会话的已完成 turn 内，且不是进行中的末 turn
-//   3. threadId / topicId 可解析（含本提案新建的临时 id），临时 id 不得与既有 id 撞名
-//   4. 边只向过去（同会话比 turn 号，跨会话比时间）；target 形状与 edgeKind 匹配
-//   5. 每个 turnRef 恰一行 placement
-//   6. 修订窗口（k）之外的既有 placement 不得改动
-//   7. user_manual_edit 来源的记录不得被作业改动
-//   8. 签名对账：作业读到的 turn 序列签名与 apply 时刻一致，否则拒绝并标 stale
+//   2. 签名对账：作业**发起时**留存的签名与**落盘时刻重读**的快照一致，否则拒绝并标 stale
+//      （排在所有语义闸之前：签名对不上说明判定基于过期快照，后面校验什么都没有意义）
+//   3. 每个 turnRef 可解析：在对应会话的已完成 turn 内，且不是进行中的末 turn
+//   4. threadId / topicId 可解析（含本提案新建的临时 id），临时 id 不得与既有 id 撞名、提案内也不得自相重复
+//   5. 边只向过去（同会话比 turn 号，跨会话比时间）；target 形状与 edgeKind 匹配
+//   6. placements 恰好覆盖本次待判范围：每个待判 turn 恰一行，且不含范围外的 turn
+//   7. user_manual_edit 来源的记录不得被作业改动（与闸 8 同一遍遍历，命中时先于闸 8 返回；
+//      thread 修订那半要按 topic 维度解析 id，故排在闸 9 之后执行）
+//   8. 修订窗口（k）之外的既有 placement 不得改动
 //   9. 派生正式 id / 复用 topic
 //  10. durable-write-before-ack —— 由 store 的原子写承担，不在本模块
 //
@@ -48,9 +51,12 @@ export type ExplorationThreadGraphApplyRejectionReason =
 	| "thread_id_unresolvable"
 	| "topic_id_unresolvable"
 	| "temporary_id_collides_with_existing_id"
+	| "duplicate_temporary_id_within_proposal"
 	| "edge_target_shape_invalid"
 	| "edge_target_not_in_past"
 	| "duplicate_placement_for_turn"
+	| "placement_missing_for_turn_under_judgement"
+	| "placement_outside_turns_under_judgement"
 	| "frozen_placement_outside_revision_window"
 	| "user_manual_edit_conflict"
 	| "turn_source_signature_mismatch";
@@ -61,8 +67,13 @@ export interface ApplyExplorationThreadGraphMaintenanceProposalInput {
 	proposal: unknown;
 	/** apply 时刻重新读到的 turn 快照，按 conversationSessionId 索引。 */
 	turnSnapshotsBySession: ReadonlyMap<string, CompletedTurnSequenceSnapshot>;
-	/** 作业**发起时**读到的各会话签名；与 apply 时刻不一致即闸 8 拒绝。 */
+	/** 作业**发起时**读到的各会话签名；与 apply 时刻不一致即闸 2 拒绝。 */
 	proposalSourceTurnSequenceSignatureBySession: Readonly<Record<string, string>>;
+	/**
+	 * 本次作业交给分身判定的 turn 范围（编排侧按模式与批次算好，与 prompt 里列出的那份完全一致）。
+	 * 闸 6 拿它校验 placements **恰好覆盖**该范围：漏判与越界都整份拒绝。
+	 */
+	turnsUnderJudgement: readonly { conversationSessionId: string; turnNumber: number }[];
 	currentCollection: ExplorationThreadGraphCollection;
 	currentTopicRegistry: ExplorationTopicRegistry;
 	revisionWindowTurnCount?: number;
@@ -80,7 +91,7 @@ export type ApplyExplorationThreadGraphMaintenanceProposalResult =
 			outcome: "rejected";
 			rejectionReason: ExplorationThreadGraphApplyRejectionReason;
 			/**
-			 * 拒绝时仍需落盘的**唯一**东西：stale 标记（闸 8 的「拒绝并标 stale」）。
+			 * 拒绝时仍需落盘的**唯一**东西：stale 标记（闸 2 的「拒绝并标 stale」）。
 			 * 非 null 时调用方原样写盘——除 staleReason / updatedAt 外与现状全等。
 			 */
 			collectionStaleMarkUpdate: ExplorationThreadGraphCollection | null;
@@ -129,7 +140,7 @@ function buildResolvedTurnPositionIndex(
 	return index;
 }
 
-/** 收集提案里出现的所有 turnRef，供闸 2 统一校验。 */
+/** 收集提案里出现的所有 turnRef，供闸 3 统一校验。 */
 function collectProposalTurnRefs(proposal: ExplorationThreadGraphMaintenanceProposal): ExplorationTurnRef[] {
 	const turnRefs: ExplorationTurnRef[] = [];
 	for (const placement of proposal.placements) turnRefs.push(placement.turnRef);
@@ -208,7 +219,7 @@ export function applyExplorationThreadGraphMaintenanceProposal(
 	}
 	const proposal = parsedProposal.data;
 
-	// ── 闸 8：签名对账（放在形状之后、语义之前——签名不对时后面的校验都没有意义）──
+	// ── 闸 2：签名对账（放在形状之后、语义之前——签名不对时后面的校验都没有意义）──
 	for (const [conversationSessionId, snapshot] of turnSnapshotsBySession) {
 		const signatureSeenByJob = proposalSourceTurnSequenceSignatureBySession[conversationSessionId];
 		if (signatureSeenByJob !== undefined && signatureSeenByJob !== snapshot.sourceSignature) {
@@ -220,7 +231,7 @@ export function applyExplorationThreadGraphMaintenanceProposal(
 		}
 	}
 
-	// ── 闸 2：turnRef 可解析，且不是进行中的末 turn ──
+	// ── 闸 3：turnRef 可解析，且不是进行中的末 turn ──
 	const turnPositionIndex = buildResolvedTurnPositionIndex(turnSnapshotsBySession);
 	for (const turnRef of collectProposalTurnRefs(proposal)) {
 		const snapshot = turnSnapshotsBySession.get(turnRef.conversationSessionId);
@@ -235,11 +246,19 @@ export function applyExplorationThreadGraphMaintenanceProposal(
 		}
 	}
 
-	// ── 闸 3：thread / topic 引用可解析；临时 id 不得与既有 id 撞名 ──
+	// ── 闸 4：thread / topic 引用可解析；临时 id 不得与既有 id 撞名 ──
 	const existingThreadIds = new Set(currentCollection.threads.map((thread) => thread.threadId));
 	const existingTopicIds = new Set(currentTopicRegistry.topics.map((topic) => topic.topicId));
 	const temporaryThreadIds = new Set(proposal.newThreads.map((newThread) => newThread.temporaryThreadId));
 	const temporaryTopicIds = new Set(proposal.topicProposals.map((topicProposal) => topicProposal.temporaryTopicId));
+	// 提案**内部**的临时 id 也必须互不重复：Set 会把重复项吞掉，而闸 8 与闸 9 的临时 id → 正式 id 映射
+	// 是「后写覆盖」的 Map，重复时两条 newThread 会拿到同一个正式 threadId 落盘（事实层无唯一性约束）。
+	if (temporaryThreadIds.size !== proposal.newThreads.length) {
+		return reject("duplicate_temporary_id_within_proposal");
+	}
+	if (temporaryTopicIds.size !== proposal.topicProposals.length) {
+		return reject("duplicate_temporary_id_within_proposal");
+	}
 	for (const temporaryThreadId of temporaryThreadIds) {
 		if (existingThreadIds.has(temporaryThreadId)) return reject("temporary_id_collides_with_existing_id");
 	}
@@ -273,7 +292,7 @@ export function applyExplorationThreadGraphMaintenanceProposal(
 		}
 	}
 
-	// ── 闸 4：边的 target 形状与「只向过去」──
+	// ── 闸 5：边的 target 形状与「只向过去」──
 	// `concludes` 指向 thread（渲染为合流线），其余四种指向 turn；两者互斥且必须二选一。
 	const proposalPlacementByTurnKey = new Map(
 		proposal.placements.map((placement) => [formatExplorationTurnRefKey(placement.turnRef), placement]),
@@ -319,12 +338,28 @@ export function applyExplorationThreadGraphMaintenanceProposal(
 		}
 	}
 
-	// ── 闸 5：每个 turnRef 恰一行 placement（提案内不得重复）──
+	// ── 闸 6：placements 恰好覆盖本次待判范围 ──
+	// 三件事一起判：提案内不得对同一个 turn 给两行、待判 turn 一个都不能漏、也不许判范围外的 turn。
+	// 漏判尤其要拦死：落装末尾的 frontier 只看「最大已归位 turn 号」，中间被跳过的 turn 连 stale 都标不出来，
+	// 调用方会把分身的整体/局部遗漏当成一次成功确认。
 	if (proposalPlacementByTurnKey.size !== proposal.placements.length) {
 		return reject("duplicate_placement_for_turn");
 	}
+	const turnUnderJudgementKeys = new Set(
+		input.turnsUnderJudgement.map((turnUnderJudgement) => formatExplorationTurnRefKey(turnUnderJudgement)),
+	);
+	for (const turnUnderJudgementKey of turnUnderJudgementKeys) {
+		if (!proposalPlacementByTurnKey.has(turnUnderJudgementKey)) {
+			return reject("placement_missing_for_turn_under_judgement");
+		}
+	}
+	for (const proposedPlacementTurnKey of proposalPlacementByTurnKey.keys()) {
+		if (!turnUnderJudgementKeys.has(proposedPlacementTurnKey)) {
+			return reject("placement_outside_turns_under_judgement");
+		}
+	}
 
-	// ── 闸 6 / 闸 7：修订窗口冻结 与 user_manual_edit 不可动 ──
+	// ── 闸 7 / 闸 8：user_manual_edit 不可动 与 修订窗口冻结（同一遍遍历，前者命中时先返回）──
 	// frontier 按会话取「既有 placement 里最大的 turn 号」；窗口 = frontier 往回 k 个 turn。
 	const frontierTurnNumberBySession = new Map<string, number>();
 	for (const placement of currentCollection.turnThreadPlacements) {
@@ -371,20 +406,6 @@ export function applyExplorationThreadGraphMaintenanceProposal(
 		}
 	}
 
-	const existingThreadById = new Map(currentCollection.threads.map((thread) => [thread.threadId, thread]));
-	for (const threadRevision of proposal.threadRevisions) {
-		const existingThread = existingThreadById.get(threadRevision.threadId);
-		if (existingThread === undefined) return reject("thread_id_unresolvable");
-		if (existingThread.generationSource !== "user_manual_edit") continue;
-		const revisionWouldChangeThread =
-			(threadRevision.threadTitle !== undefined && threadRevision.threadTitle !== existingThread.threadTitle) ||
-			(threadRevision.threadLifecycleStatus !== undefined &&
-				threadRevision.threadLifecycleStatus !== existingThread.threadLifecycleStatus) ||
-			(threadRevision.primaryTopicId !== undefined &&
-				resolveThreadId(threadRevision.primaryTopicId) !== existingThread.primaryTopicId);
-		if (revisionWouldChangeThread) return reject("user_manual_edit_conflict");
-	}
-
 	// ── 闸 9：派生正式 id / 复用 topic ──
 	const topicLookupByNormalizedTitle = buildTopicLookupByNormalizedTitle(currentTopicRegistry.topics);
 	let nextTopicOrdinal = deriveNextTopicOrdinal(currentTopicRegistry.topics);
@@ -414,6 +435,24 @@ export function applyExplorationThreadGraphMaintenanceProposal(
 	}
 	const resolveTopicId = (topicIdReference: string): string =>
 		resolvedTopicIdByTemporaryId.get(topicIdReference) ?? topicIdReference;
+
+	// ── 闸 7（thread 修订部分）：user_manual_edit 来源的 thread 不得被作业改动 ──
+	// 排在闸 9 之后是必须的：primaryTopicId 要按 **topic** 维度解析，而临时 topic id → 正式 topic id
+	// 的映射到闸 9 才建起来。早先这里误用 resolveThreadId，临时 topic id 与临时 thread id 同名时会被
+	// 解析成 thread-N，把一条毫无改动的修订误判成冲突。
+	const existingThreadById = new Map(currentCollection.threads.map((thread) => [thread.threadId, thread]));
+	for (const threadRevision of proposal.threadRevisions) {
+		const existingThread = existingThreadById.get(threadRevision.threadId);
+		if (existingThread === undefined) return reject("thread_id_unresolvable");
+		if (existingThread.generationSource !== "user_manual_edit") continue;
+		const revisionWouldChangeThread =
+			(threadRevision.threadTitle !== undefined && threadRevision.threadTitle !== existingThread.threadTitle) ||
+			(threadRevision.threadLifecycleStatus !== undefined &&
+				threadRevision.threadLifecycleStatus !== existingThread.threadLifecycleStatus) ||
+			(threadRevision.primaryTopicId !== undefined &&
+				resolveTopicId(threadRevision.primaryTopicId) !== existingThread.primaryTopicId);
+		if (revisionWouldChangeThread) return reject("user_manual_edit_conflict");
+	}
 
 	// ── 落装 ──
 	const nextThreads: ExplorationThread[] = currentCollection.threads.map((thread) => {

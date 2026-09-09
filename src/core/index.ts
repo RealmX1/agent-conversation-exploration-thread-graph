@@ -77,6 +77,7 @@ export {
 	readExplorationThreadGraphCollection,
 	readExplorationTopicRegistry,
 	resolveExplorationThreadGraphCollectionPath,
+	resolveExplorationThreadGraphStoreWriteLockPath,
 	resolveExplorationTopicRegistryPath,
 } from "./exploration-thread-graph-store.js";
 

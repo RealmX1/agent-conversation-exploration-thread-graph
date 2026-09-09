@@ -33,6 +33,8 @@ function buildFunnelInput(
 		proposalSourceTurnSequenceSignatureBySession: buildSignatureBySession([snapshot]),
 		currentCollection: buildCollection("exploration-1"),
 		currentTopicRegistry: buildTopicRegistry(),
+		// 默认空：闸 6 之前就被拦下的用例用不到它，走到闸 6 之后的用例各自显式给出本次待判范围。
+		turnsUnderJudgement: [],
 		now: TEST_NOW_MILLISECONDS,
 		...overrides,
 	};
@@ -69,7 +71,7 @@ describe("apply 漏斗", () => {
 		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "proposal_shape_invalid" });
 	});
 
-	it("闸 2：turnRef 指向不存在的 turn 时拒绝", () => {
+	it("闸 3：turnRef 指向不存在的 turn 时拒绝", () => {
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
 				proposal: buildProposal({
@@ -88,7 +90,7 @@ describe("apply 漏斗", () => {
 		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "turn_ref_unresolvable" });
 	});
 
-	it("闸 2：指向进行中的末 turn 时拒绝", () => {
+	it("闸 3：指向进行中的末 turn 时拒绝", () => {
 		const snapshot = buildCompletedTurnSequenceSnapshot(SESSION_ID, 3, { inProgressTurnNumber: 4 });
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
@@ -110,7 +112,7 @@ describe("apply 漏斗", () => {
 		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "turn_ref_is_in_progress_turn" });
 	});
 
-	it("闸 3：引用不存在的 threadId 时拒绝", () => {
+	it("闸 4：引用不存在的 threadId 时拒绝", () => {
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
 				proposal: buildProposal({
@@ -128,7 +130,7 @@ describe("apply 漏斗", () => {
 		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "thread_id_unresolvable" });
 	});
 
-	it("闸 4：边指向未来时拒绝", () => {
+	it("闸 5：边指向未来时拒绝", () => {
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
 				proposal: buildProposal({
@@ -155,7 +157,7 @@ describe("apply 漏斗", () => {
 		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "edge_target_not_in_past" });
 	});
 
-	it("闸 4：非 concludes 边却指向 thread 时拒绝", () => {
+	it("闸 5：非 concludes 边却指向 thread 时拒绝", () => {
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
 				currentCollection: buildCollection("exploration-1", { threads: [buildThread("thread-1")] }),
@@ -175,7 +177,7 @@ describe("apply 漏斗", () => {
 		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "edge_target_shape_invalid" });
 	});
 
-	it("闸 5：同一个 turn 出现两行 placement 时拒绝", () => {
+	it("闸 6：同一个 turn 出现两行 placement 时拒绝", () => {
 		const placementForTurnOne = {
 			turnRef: buildTurnRef(SESSION_ID, 1),
 			threadId: "tmp-thread",
@@ -193,7 +195,52 @@ describe("apply 漏斗", () => {
 		expect(result).toMatchObject({ outcome: "rejected", rejectionReason: "duplicate_placement_for_turn" });
 	});
 
-	it("闸 6：修订窗口之外的既有 placement 不得改动", () => {
+	it("闸 6：待判 turn 没有 placement 时整份拒绝", () => {
+		// 分身整体或局部漏判必须当场拒绝：frontier 只看最大 turn 号，中间漏掉的 turn 连 stale 都标不出来。
+		const result = applyExplorationThreadGraphMaintenanceProposal(
+			buildFunnelInput({
+				turnsUnderJudgement: [1, 2].map((turnNumber) => buildTurnRef(SESSION_ID, turnNumber)),
+				proposal: buildProposal({
+					...buildNewThreadAndTopicProposalParts(),
+					placements: [
+						{
+							turnRef: buildTurnRef(SESSION_ID, 2),
+							threadId: "tmp-thread",
+							placementConfidence: "high",
+							deviationRationale: null,
+						},
+					],
+				}),
+			}),
+		);
+		expect(result).toMatchObject({
+			outcome: "rejected",
+			rejectionReason: "placement_missing_for_turn_under_judgement",
+		});
+	});
+
+	it("闸 6：placement 落在待判范围之外时整份拒绝", () => {
+		const result = applyExplorationThreadGraphMaintenanceProposal(
+			buildFunnelInput({
+				turnsUnderJudgement: [buildTurnRef(SESSION_ID, 1)],
+				proposal: buildProposal({
+					...buildNewThreadAndTopicProposalParts(),
+					placements: [1, 4].map((turnNumber) => ({
+						turnRef: buildTurnRef(SESSION_ID, turnNumber),
+						threadId: "tmp-thread",
+						placementConfidence: "high",
+						deviationRationale: null,
+					})),
+				}),
+			}),
+		);
+		expect(result).toMatchObject({
+			outcome: "rejected",
+			rejectionReason: "placement_outside_turns_under_judgement",
+		});
+	});
+
+	it("闸 8：修订窗口之外的既有 placement 不得改动", () => {
 		const currentCollection = buildCollection("exploration-1", {
 			threads: [buildThread("thread-1"), buildThread("thread-2")],
 			// frontier = 6，窗口 k=3 ⇒ turn 1/2/3 冻结，turn 4/5/6 可改。
@@ -216,13 +263,23 @@ describe("apply 漏斗", () => {
 
 		expect(
 			applyExplorationThreadGraphMaintenanceProposal(
-				buildFunnelInput({ currentCollection, currentTopicRegistry, proposal: buildMoveProposal(2) }),
+				buildFunnelInput({
+					currentCollection,
+					currentTopicRegistry,
+					proposal: buildMoveProposal(2),
+					turnsUnderJudgement: [buildTurnRef(SESSION_ID, 2)],
+				}),
 			),
 		).toMatchObject({ outcome: "rejected", rejectionReason: "frozen_placement_outside_revision_window" });
 
 		expect(
 			applyExplorationThreadGraphMaintenanceProposal(
-				buildFunnelInput({ currentCollection, currentTopicRegistry, proposal: buildMoveProposal(5) }),
+				buildFunnelInput({
+					currentCollection,
+					currentTopicRegistry,
+					proposal: buildMoveProposal(5),
+					turnsUnderJudgement: [buildTurnRef(SESSION_ID, 5)],
+				}),
 			),
 		).toMatchObject({ outcome: "accepted" });
 	});
@@ -239,6 +296,7 @@ describe("apply 漏斗", () => {
 				buildFunnelInput({
 					currentCollection,
 					currentTopicRegistry,
+					turnsUnderJudgement: [buildTurnRef(SESSION_ID, 6)],
 					proposal: buildProposal({
 						placements: [
 							{
@@ -257,6 +315,7 @@ describe("apply 漏斗", () => {
 			buildFunnelInput({
 				currentCollection,
 				currentTopicRegistry,
+				turnsUnderJudgement: [buildTurnRef(SESSION_ID, 6)],
 				proposal: buildProposal({
 					placements: [
 						{
@@ -275,7 +334,52 @@ describe("apply 漏斗", () => {
 		expect(idempotentResult.collection.turnThreadPlacements[0]?.placementSource).toBe("user_manual_edit");
 	});
 
-	it("闸 8：签名对不上时拒绝，并回一份只改 staleReason 的集合", () => {
+	it("闸 7：user_manual_edit thread 的 primaryTopicId 按 topic 维度解析", () => {
+		// 同一个字符串同时当临时 topic id 与临时 thread id 是合法的；解析错维度会把
+		// 「复用回同一个 topic、其实没改动」的修订误判成冲突，也可能漏判真正的改动。
+		const currentCollection = buildCollection("exploration-1", {
+			threads: [buildThread("thread-1", { generationSource: "user_manual_edit", primaryTopicId: "topic-7" })],
+		});
+		const currentTopicRegistry = buildTopicRegistry([buildTopic("topic-7", "Prompt Cache 命中")]);
+		const buildRevisionProposal = (topicTitle: string) =>
+			buildProposal({
+				topicProposals: [{ temporaryTopicId: "tmp-1", topicTitle, topicAliases: [], topicSummaryMarkdown: null }],
+				newThreads: [
+					{
+						temporaryThreadId: "tmp-1",
+						threadTitle: "另一条线",
+						parentThreadId: null,
+						forkedFromTurnRef: null,
+						primaryTopicId: "tmp-1",
+					},
+				],
+				threadRevisions: [{ threadId: "thread-1", primaryTopicId: "tmp-1" }],
+			});
+
+		// 标题规范化后撞上 topic-7 ⇒ 修订解析回同一个 topic，等于没改动，必须放行。
+		expect(
+			applyExplorationThreadGraphMaintenanceProposal(
+				buildFunnelInput({
+					currentCollection,
+					currentTopicRegistry,
+					proposal: buildRevisionProposal("prompt cache 命中"),
+				}),
+			),
+		).toMatchObject({ outcome: "accepted" });
+
+		// 换成另一个 topic ⇒ 真改动，闸 7 仍然要整份拒绝。
+		expect(
+			applyExplorationThreadGraphMaintenanceProposal(
+				buildFunnelInput({
+					currentCollection,
+					currentTopicRegistry,
+					proposal: buildRevisionProposal("作业编排"),
+				}),
+			),
+		).toMatchObject({ outcome: "rejected", rejectionReason: "user_manual_edit_conflict" });
+	});
+
+	it("闸 2：签名对不上时拒绝，并回一份只改 staleReason 的集合", () => {
 		const snapshot = buildCompletedTurnSequenceSnapshot(SESSION_ID, 6);
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
@@ -294,6 +398,7 @@ describe("apply 漏斗", () => {
 			buildFunnelInput({
 				currentCollection: buildCollection("exploration-1", { threads: [buildThread("thread-1")] }),
 				currentTopicRegistry: buildTopicRegistry([buildTopic("topic-7", "Prompt Cache 命中")]),
+				turnsUnderJudgement: [buildTurnRef(SESSION_ID, 3)],
 				proposal: buildProposal({
 					topicProposals: [
 						// 与既有 topic 仅大小写/标点/空白之差 ⇒ 必须复用 topic-7 而不是长出新条目。
@@ -349,7 +454,7 @@ describe("apply 漏斗", () => {
 		expect(result.collection.turnThreadPlacements[0]?.threadId).toBe("thread-3");
 	});
 
-	it("闸 3：临时 id 与既有 id 撞名时拒绝", () => {
+	it("闸 4：临时 id 与既有 id 撞名时拒绝", () => {
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
 				currentCollection: buildCollection("exploration-1", { threads: [buildThread("thread-1")] }),
@@ -376,9 +481,63 @@ describe("apply 漏斗", () => {
 		});
 	});
 
+	it("闸 4：提案内两个 newThread 共用同一个 temporaryThreadId 时拒绝", () => {
+		// 不拦就会被闸 9 的「后写覆盖」映射赋成同一个正式 threadId，重复 id 直接进事实层。
+		const result = applyExplorationThreadGraphMaintenanceProposal(
+			buildFunnelInput({
+				currentCollection: buildCollection("exploration-1", { threads: [buildThread("thread-1")] }),
+				currentTopicRegistry: buildTopicRegistry([buildTopic("topic-1", "起点")]),
+				proposal: buildProposal({
+					topicProposals: [
+						{ temporaryTopicId: "tmp-topic", topicTitle: "新题", topicAliases: [], topicSummaryMarkdown: null },
+					],
+					newThreads: ["线甲", "线乙"].map((threadTitle) => ({
+						temporaryThreadId: "tmp-same",
+						threadTitle,
+						parentThreadId: null,
+						forkedFromTurnRef: null,
+						primaryTopicId: "tmp-topic",
+					})),
+					placements: [
+						{
+							turnRef: buildTurnRef(SESSION_ID, 1),
+							threadId: "tmp-same",
+							placementConfidence: "high",
+							deviationRationale: null,
+						},
+					],
+				}),
+			}),
+		);
+		expect(result).toMatchObject({
+			outcome: "rejected",
+			rejectionReason: "duplicate_temporary_id_within_proposal",
+		});
+	});
+
+	it("闸 4：提案内两个 topicProposal 共用同一个 temporaryTopicId 时拒绝", () => {
+		const result = applyExplorationThreadGraphMaintenanceProposal(
+			buildFunnelInput({
+				proposal: buildProposal({
+					topicProposals: ["缓存命中调查", "作业编排"].map((topicTitle) => ({
+						temporaryTopicId: "tmp-topic-same",
+						topicTitle,
+						topicAliases: [],
+						topicSummaryMarkdown: null,
+					})),
+				}),
+			}),
+		);
+		expect(result).toMatchObject({
+			outcome: "rejected",
+			rejectionReason: "duplicate_temporary_id_within_proposal",
+		});
+	});
+
 	it("落装后刷新 frontier 与签名，并在仍有未归位 turn 时标 stale", () => {
 		const result = applyExplorationThreadGraphMaintenanceProposal(
 			buildFunnelInput({
+				turnsUnderJudgement: [1, 2].map((turnNumber) => buildTurnRef(SESSION_ID, turnNumber)),
 				proposal: buildProposal({
 					...buildNewThreadAndTopicProposalParts(),
 					placements: [1, 2].map((turnNumber) => ({

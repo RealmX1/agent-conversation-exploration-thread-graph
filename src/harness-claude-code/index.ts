@@ -13,7 +13,10 @@ export {
 } from "./bounded-json-lines-reader.js";
 
 export type { ClaudeCodeForkedSessionWorkBranchExecutorOptions } from "./claude-code-forked-session-work-branch-executor.js";
-export { ClaudeCodeForkedSessionWorkBranchExecutor } from "./claude-code-forked-session-work-branch-executor.js";
+export {
+	ClaudeCodeForkedSessionWorkBranchExecutor,
+	DEFAULT_CLAUDE_EXECUTABLE_PATH,
+} from "./claude-code-forked-session-work-branch-executor.js";
 export type { ClaudeCodeTranscriptCompletedTurnSourceOptions } from "./claude-code-transcript-completed-turn-source.js";
 export { ClaudeCodeTranscriptCompletedTurnSource } from "./claude-code-transcript-completed-turn-source.js";
 export type { ClaudeCodeTranscriptRecordRole } from "./claude-code-transcript-record-classifier.js";

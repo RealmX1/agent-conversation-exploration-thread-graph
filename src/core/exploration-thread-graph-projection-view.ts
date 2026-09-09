@@ -182,18 +182,30 @@ export function buildExplorationThreadGraphProjectionView(
 	const parentTurnRowIdsByTurnRowId = new Map<string, string[]>();
 	for (const entry of chronologicalEntries) {
 		const placement = placementByTurnRowId.get(entry.turnRowId);
+		const currentRowChronologicalIndex = chronologicalIndexByTurnRowId.get(entry.turnRowId);
+		// 「parent 只向过去」是渲染层的硬不变量：显式边、分叉锚点一视同仁地过这一关，
+		// 位置查不到或指向更晚（含自指）的候选行一律丢弃，否则 lane 布局会自相矛盾。
+		const isCandidateParentRowStrictlyEarlierThanCurrentRow = (candidateParentTurnRowId: string): boolean => {
+			const candidateParentChronologicalIndex = chronologicalIndexByTurnRowId.get(candidateParentTurnRowId);
+			if (candidateParentChronologicalIndex === undefined || currentRowChronologicalIndex === undefined) {
+				return false;
+			}
+			return candidateParentChronologicalIndex < currentRowChronologicalIndex;
+		};
 		const parentTurnRowIds: string[] = [];
 		if (placement !== undefined) {
 			const previousTurnRowIdInThread = previousTurnRowIdByThreadId.get(placement.threadId);
 			if (previousTurnRowIdInThread !== undefined) {
+				// 同线前驱按时间序遍历得来，必然更早，无需再校验。
 				parentTurnRowIds.push(previousTurnRowIdInThread);
 			} else {
 				// thread 的第一个 turn：它的 parent 是分叉锚点 turn（根 thread 则没有 parent）。
+				// 事实层可能存下一个指向未来的 forkedFromTurnRef（漏斗未对它做时间序校验），这里必须挡掉。
 				const thread = threadById.get(placement.threadId);
 				const forkAnchorTurnRef = thread?.forkedFromTurnRef ?? null;
 				if (forkAnchorTurnRef !== null) {
 					const forkAnchorRowId = formatExplorationTurnRefKey(forkAnchorTurnRef);
-					if (forkAnchorRowId !== entry.turnRowId && chronologicalIndexByTurnRowId.has(forkAnchorRowId)) {
+					if (isCandidateParentRowStrictlyEarlierThanCurrentRow(forkAnchorRowId)) {
 						parentTurnRowIds.push(forkAnchorRowId);
 					}
 				}
@@ -201,10 +213,8 @@ export function buildExplorationThreadGraphProjectionView(
 			previousTurnRowIdByThreadId.set(placement.threadId, entry.turnRowId);
 		}
 		for (const explicitParentRowId of explicitParentRowIdsBySourceRowId.get(entry.turnRowId) ?? []) {
-			// 只认指向**更早**行的 parent，且去重；否则 lane 布局会自相矛盾。
-			const parentIndex = chronologicalIndexByTurnRowId.get(explicitParentRowId);
-			const ownIndex = chronologicalIndexByTurnRowId.get(entry.turnRowId);
-			if (parentIndex === undefined || ownIndex === undefined || parentIndex >= ownIndex) continue;
+			// 只认指向**更早**行的 parent，且去重。
+			if (!isCandidateParentRowStrictlyEarlierThanCurrentRow(explicitParentRowId)) continue;
 			if (!parentTurnRowIds.includes(explicitParentRowId)) parentTurnRowIds.push(explicitParentRowId);
 		}
 		parentTurnRowIdsByTurnRowId.set(entry.turnRowId, parentTurnRowIds);
