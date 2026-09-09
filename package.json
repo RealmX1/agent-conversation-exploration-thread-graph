@@ -1,0 +1,60 @@
+{
+	"name": "agent-conversation-exploration-thread-graph",
+	"version": "0.0.0",
+	"description": "把一次 agent 会话探索场次建模为 git-graph 语义的 thread graph：thread = 分支（lane），turn = 提交，多对一关系边 = merge；由主会话 fork 出的 work-branch 作业维护，产出给任何宿主渲染的 projection 整值。",
+	"private": true,
+	"type": "module",
+	"engines": {
+		"node": ">=22"
+	},
+	"bin": {
+		"agent-conversation-exploration-thread-graph": "dist/cli/agent-conversation-exploration-thread-graph-cli.js"
+	},
+	"exports": {
+		"./core": {
+			"types": "./dist/core/index.d.ts",
+			"import": "./dist/core/index.js"
+		},
+		"./harness-claude-code": {
+			"types": "./dist/harness-claude-code/index.d.ts",
+			"import": "./dist/harness-claude-code/index.js"
+		},
+		"./harness-codex": {
+			"types": "./dist/harness-codex/index.d.ts",
+			"import": "./dist/harness-codex/index.js"
+		},
+		"./cli": {
+			"types": "./dist/cli/agent-conversation-exploration-thread-graph-cli.d.ts",
+			"import": "./dist/cli/agent-conversation-exploration-thread-graph-cli.js"
+		},
+		"./dsh-plugin": {
+			"types": "./dist/dsh-plugin/index.d.ts",
+			"import": "./dist/dsh-plugin/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"CONTEXT.md"
+	],
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"prepare": "npm run build",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"lint": "biome check .",
+		"format": "biome check --write .",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"check": "biome check . && npm run typecheck && npm run test"
+	},
+	"dependencies": {
+		"zod": "^4.3.6"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.12",
+		"@types/node": "^22.10.5",
+		"tsx": "^4.20.3",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.0"
+	}
+}
