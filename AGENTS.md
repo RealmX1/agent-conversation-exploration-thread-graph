@@ -30,7 +30,7 @@ npm test               # vitest run（test/**/*.test.ts）
 - **契约变更先改文档再改代码**：`/core` 与 `/harness-claude-code` 的公开 API、schema、env 变量名是与 cline-kanban 的共享真相（handoff A.13）。改 schema 必 bump `EXPLORATION_THREAD_GRAPH_SCHEMA_VERSION` 并记 `CHANGELOG.md`。
 - **依赖方向单向**：本仓库**不得 import cline-kanban 任何代码**；需要的骨架从它**复制**过来（handoff A.10 列了路径）。dsh 包只作 `/dsh-plugin` 的 peerDependency，不进 `/core`。
 - **fork 执行器的 argv 由本包完全控制**：env 必含 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`；**绝不**给 `--bare` / `--safe-mode`（会绕过宿主 hooks，让分身事件被当成主任务事件）。作业只写 `storeRoot`，不写宿主任何文件。
-- **prompt cache 命中是 D5 的前提**：fork 必须与主会话同 model / 同 append-system-prompt / 同 settings（模板由宿主逐字提供）；R3 第一件事是实测 `usage.cacheReadInputTokens > 0`。
+- **fork 必须与主会话同 model / 同 append-system-prompt / 同 settings**（模板由宿主逐字提供）——理由是**决定分身行为**。原「prompt cache 命中是 D5 的前提」已被 R3 实测推翻：重型会话因 [#77306](https://github.com/anthropics/claude-code/issues/77306) 恒不命中，实测 $2.2–$2.4/次 @220k；成本靠**宿主侧触发节流**控（详见 handoff A.6 / A.14 与完工交接 §2.1）。
 
 ## 约定
 
@@ -44,6 +44,7 @@ npm test               # vitest run（test/**/*.test.ts）
 | 文档 | 内容 |
 | --- | --- |
 | `.plan/docs/exploration-thread-graph-core-handoff.md` | 完整 handoff：使命/非目标、包布局、核心接口、schema、作业与漏斗、harness 适配、CLI、dsh smoke、验证、里程碑、与 cline-kanban 的契约 |
+| `.plan/docs/exploration-thread-graph-core-pass-a-completion-handback.md` | Pass A 完工交接：交付 SHA、被实测推翻的三条前提（fork cache / append-system-prompt / env 洗净）、RVF 后的 API 增量、代为拍板的决定、未做的部分与悬置风险 |
 | `CONTEXT.md` | 术语表（只放术语不放实现） |
 | `README.md` | 定位、三层架构图、裸用法、与 cline-kanban / dsh 的关系 |
 | `CHANGELOG.md` | schema 版本与公开 API 变更记录 |

@@ -4,6 +4,9 @@
 > 参考仓库**只读**：cline-kanban `~/Documents/GitHub/cline-kanban`（第一宿主，Exploratory Mode M0–M2 骨架在 main）、dsh `~/Documents/GitHub/deepseek-harness`（目标宿主，接口要镜像的对象）。
 > 全程遵守用户全局规则：中文文档 / 注释 / commit；命名过度指定；未经用户要求不 commit、绝不 push；无 `any`；不 inline import；执行顺序自行拓扑排序不问用户，只有会改变最终结果且无明显占优方案的 trade-off 才提问。
 > 术语以 `CONTEXT.md` 为准；本仓库承重规则在 `AGENTS.md`。
+>
+> **Pass A 已于 2026-09-10 全部完工**（R0–R4 + RVF strict 轮）。本文已就地更新为最终状态；
+> 「实测推翻了哪些前提、代为拍板了什么、什么没做」见 `.plan/docs/exploration-thread-graph-core-pass-a-completion-handback.md`。
 
 ## 0. 背景：为什么有这个仓库
 
@@ -52,8 +55,8 @@ cline-kanban 的 Exploratory Mode（M0–M2）已落地「session map + findings
 
 | 阶段 | Pass A（本仓库） | Pass B（cline-kanban b04a4） |
 |---|---|---|
-| 并行期 | R0 脚手架（**已完成**）→ R1 core → R2 claude harness → R3 作业 + CLI | 原生会话身份捕获；删旧 map 链；指令改探索礼仪；hooks 的作业 env 短路 + PreToolUse deny |
-| 交接点 1 | 打 tag `v0.1.0`（由用户执行或明示授权），给出 commit SHA；`/core` `/harness-claude-code` API 冻结 | 加依赖、触发胶水、WS、trpc、面板 |
+| 并行期 | R0→R4 **全部已完成** + RVF strict 轮已收口 | 原生会话身份捕获；删旧 map 链；指令改探索礼仪；hooks 的作业 env 短路 + PreToolUse deny |
+| 交接点 1 | **已完成**：tag `v0.1.0` → `4fd33ae`，task branch 已 push 到 origin；`/core` `/harness-claude-code` API 冻结 | 加依赖、触发胶水、WS、trpc、面板 |
 | 交接点 2 | R4 dsh smoke 适配 | 验证与收尾 |
 
 契约（A.13）是两个 pass 唯一的共享真相；任何一方要改契约，先改 A.13 再改代码。
@@ -162,15 +165,15 @@ type ConversationSessionRef =
 // ── store / 漏斗 / 视图 / 布局（R1 落地后的最终签名）
 readExplorationThreadGraphCollection(storeRoot, explorationId, now?) / readExplorationTopicRegistry(storeRoot)
 mutateExplorationThreadGraph(storeRoot, explorationId, mutator, now?)   // collection 与 topic 注册表同锁落盘；durable-write-before-ack
-                                                                       // mutator 可返回 Promise：调用方得以在写锁内重读外部来源（作业就靠它做闸 8 对账）
+                                                                       // mutator 可返回 Promise：调用方得以在写锁内重读外部来源（作业就靠它做闸 2 对账）
 applyExplorationThreadGraphMaintenanceProposal({
   explorationId, proposal /* 未校验，闸 1 在漏斗内做 */, turnSnapshotsBySession,
-  proposalSourceTurnSequenceSignatureBySession,   // 作业发起时读到的签名，闸 8 拿它对账
-  turnsUnderJudgement,                            // 本次交给分身判定的 turn 范围，闸 5 拿它校验覆盖
+  proposalSourceTurnSequenceSignatureBySession,   // 作业发起时读到的签名，闸 2 拿它对账
+  turnsUnderJudgement,                            // 本次交给分身判定的 turn 范围，闸 6 拿它校验覆盖
   currentCollection, currentTopicRegistry,        // 漏斗要跨两者派生 id / 复用 topic
   revisionWindowTurnCount?, maintenanceJobUsage?, now,
 }) → { outcome: "accepted"; collection; topicRegistry }
-  | { outcome: "rejected"; rejectionReason; collectionStaleMarkUpdate }   // 后者非 null 时调用方原样写盘（闸 8 的「拒绝并标 stale」）
+  | { outcome: "rejected"; rejectionReason; collectionStaleMarkUpdate }   // 后者非 null 时调用方原样写盘（闸 2 的「拒绝并标 stale」）
 buildExplorationThreadGraphProjectionView(collection, turnSnapshotsBySession, topicRegistry) → ExplorationThreadGraphProjectionView
 layoutThreadGraphLanes(rows: { id: string; parentIds: string[] }[]) → ThreadGraphLaneLayoutRow[]   // rows 必须**新→旧**（git log 序）
 ```
@@ -210,7 +213,7 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 
 ## A.5 维护作业与漏斗
 
-**作业输入**：`{ explorationId, sessions: ConversationSessionRef[], turnSource, executor, store, mode: "initial_backfill"|"incremental", revisionWindow: 3, batchSize }`。**turnSource 读两次**：发起时那次只用来组 prompt 与选待判范围；fork 返回后、落盘前在 store 的写锁内**重读一次**，拿「落盘时刻的新快照 + 发起时留存的旧签名」交给闸 8 对账——只读一次就是同源自比，闸 8 会形同虚设。主会话 = `sessions[0]`（fork 它）；by-the-way 会话的 turn 也在 prompt 里列出，其分叉锚点直接取 `forkedFromParentSessionTurnNumber`，作业只判父级。
+**作业输入**：`{ explorationId, sessions: ConversationSessionRef[], turnSource, executor, store, mode: "initial_backfill"|"incremental", revisionWindow: 3, batchSize }`。**turnSource 读两次**：发起时那次只用来组 prompt 与选待判范围；fork 返回后、落盘前在 store 的写锁内**重读一次**，拿「落盘时刻的新快照 + 发起时留存的旧签名」交给闸 2 对账——只读一次就是同源自比，闸 2 会形同虚设。主会话 = `sessions[0]`（fork 它）；by-the-way 会话的 turn 也在 prompt 里列出，其分叉锚点直接取 `forkedFromParentSessionTurnNumber`，作业只判父级。
 
 **Prompt 组装**（`maintenance-job-prompt-assembly.ts`）：① 角色与目的（你是本会话的分身，只输出 JSON，不执行工具）② 判据文字（偏离定义 + 线索：用户明说换话题 / by-the-way 措辞 / 回到先前某问题 / 新假设展开）③ **turn 对照表**：`turnNumber ↔ 用户消息前 80 字 ↔ 当前 placement（threadId/topic 标题）`，让分身把编号对上自己上下文里的消息 ④ 现有 threads / topics 摘要 ⑤ 待判范围（incremental：frontier 之后 + 修订窗口内；backfill：全部，可分批）⑥ 判断清单（下）⑦ 只输出符合 schema 的 JSON。
 
@@ -253,6 +256,11 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 
 `export function apply(ctx: Context)`：① 注入 `ctx.subagents`、`ctx.sessions`、`ctx.sessionProjections`；② `ForkedWorkBranchExecutor` 的 dsh 实现 = `ctx.subagents.start({ provider: "fork", prompt, outputSchema, parent })` → `result.structured`；③ `CompletedTurnSequenceSource` 的 dsh 实现 = 从会话日志 `turn/start|end` + `user/message`（`source` 区分人类/注入）折出；④ 触发 = `turn/end` 会话事件（或 `agent/turn-stopping`）；⑤ 持久化：v1 仍用本包文件 store（`storeRoot` = `$DSH_HOME/…`），并注册一个 `ProjectionDefinition`（key `explorationThreadGraph`，`view` 返回 projection 整值；`apply` 只在 `turn/end` 时标 stale）。包名 `@deepseek-ai/cordis`、`@deepseek-ai/dsh-subagent`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-session-projection` 作 peerDependencies，钉 `0.1.x-rc`（npm 已公开发布 `@deepseek-ai/dsh` 0.1.2-rc.1、`@deepseek-ai/cordis` 4.0.1；本地 clone 是 0.1.0-rc.5，预期漂移）。验证：在 dsh 源码树 `pnpm dsh web --patch <本包 cordis.yml>` 手动跑一次 + 本包内用 dsh 的测试夹具跑一个 fold 单测。参考文档：dsh `docs/architecture.md`、`docs/subsystems/subagent.md`、`docs/subsystems/session-projection.md`、`docs/subsystems/session.md`、`packages/subagent/subagent-fork-in-process/README.md`、`packages/subagent/subagent/src/types.ts`（`SubagentResult`）、`docs/cordis-tutorial/01-first-plugin.md`、`packages/hooks/README.md`。
 
+> **R4 实际完成范围（Pass A 收口时补记，权威描述见完工交接文档 §5）**：只做了 ③（会话日志 fold）
+> 与 ⑤ 的 projection 注册那一半——`apply(ctx)` 仅注册 turn 快照 projection。② 的执行器**已实现，
+> 但由 `apply` 之外单独导出**，不参与注册；④ 的 `turn/end` 触发、⑤ 的图 projection / stale 标记 /
+> store 写入、peerDependencies、以及 `pnpm dsh web --patch` 实跑**均未做**。
+
 ## A.9 工具链与约定
 
 - Node ≥22、ESM、`tsc` emit（不引 bundler）；`NodeNext` 解析——相对 import 必须带 `.js` 后缀；`verbatimModuleSyntax` 开着，类型导入写 `import type`；`noUncheckedIndexedAccess` 与 `exactOptionalPropertyTypes` 开着。
@@ -278,27 +286,64 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 ## A.11 验证
 
 - 单测：漏斗每道闸（修订窗口、边向过去、每 turn 恰一行、manual 冲突、签名对账）；transcript 分类器（fixture：tool_result-only user 记录、isSidechain、isMeta、注入类、半行 tail、size 缩小）；proposal zod ↔ JSON Schema 往返；lane 布局（merge 线、多 parent）；projection view 跨会话时间合并。
-- 集成（opt-in，需本机 `claude` 登录）：对一个真实 Claude Code session 跑 `maintain`，断言 `structured` 满足 schema 且 `usage.cacheReadInputTokens > 0`（D5 的核心前提，**R3 第一件事**）。本机 task agent 默认走 better-ccflare 代理，cache 头是否透传也要在这一步一并验证。
+- 集成（opt-in，需本机 `claude` 登录）：对一个真实 Claude Code session 跑一次 fork，断言 `structured` 满足 schema。**原定的 `usage.cacheReadInputTokens > 0` 断言已被 R3 实测推翻并撤销**（#77306，见 A.6）——现在只把 cache 读量原样回报、不作断言；ccflare 代理透传与账号轮换都已排除，不再是本步的变量。
 - CLI e2e：fixture transcript → `maintain --mode initial_backfill`（executor 用夹具回放）→ `get --view` 断言 lane 数与边。
 - 完成定义：`npm run check` 全绿；README 含裸用法；tag `v0.1.0`（由用户执行或明示授权）并把 commit SHA 交回 cline-kanban 任务 b04a4。
 
 ## A.12 里程碑
 
-R0 脚手架（**已完成**）→ R1 core（**已完成**）→ R2 claude harness（**已完成**）→ R3 作业 + CLI（**已完成**）→ R4 dsh smoke（**已完成**）；`npm run check` 绿，69 单测 + 1 opt-in 集成。原文后续：→ R2 claude harness（投影 + 执行器 + fixture）→ R3 作业 + CLI（先实测 cache 命中）→ R4 dsh smoke → tag v0.1.0。R3 内 Codex 可选。执行顺序自行拓扑排序，不要为「先做哪个」问用户。
+**Pass A 全部里程碑已完成**（2026-09-10）：
+
+| 里程碑 | 状态 | 产物 |
+| --- | --- | --- |
+| R0 脚手架 | 已完成 | 单包多入口 / prepare 构建 / biome+vitest+tsc 检查链 |
+| R1 core | 已完成 | schema / 文件 store / apply 漏斗（10 道闸）/ projection view / lane 布局 |
+| R2 Claude Code harness | 已完成 | transcript 增量投影 / 记录判别器 / fork 执行器 / 脱敏 fixture |
+| R3 维护作业 + CLI | 已完成 | prompt 组装 / zod→JSON Schema / 作业编排 / `maintain get schema doctor` |
+| R4 dsh smoke | 已完成 | `apply(ctx)` / subagent fork 执行器 / 会话日志纯 fold |
+| RVF strict 轮 | 已完成 | 双评审 14 条 canonical issue（5 high）全部修复 |
+| tag `v0.1.0` | 已打 | 指向 `4fd33ae`，**已 push 到 origin** 的 task branch 上 |
+
+`npm run check` 全绿：**108 单测通过 + 1 opt-in 集成测试**（真实 `claude` fork，需 env 开关）。
+Codex harness（`/harness-codex`）**未做**——R3 内它一直是可选项，`codex exec resume` 是否写回同一 rollout 也仍未核实。
+dsh 插件只做到 smoke（无 UI、不引 `@deepseek-ai/*` 依赖），未在 dsh 源码树里实跑。
 
 ## A.13 与 cline-kanban 的契约（两个 pass 的共享真相）
 
 1. cline-kanban 依赖 `github:RealmX1/agent-conversation-exploration-thread-graph#<sha>`，`import` 子路径 `/core` 与 `/harness-claude-code`；web-ui 只 import `/core` 的**类型与纯函数**（projection view 类型、`layoutThreadGraphLanes`）。
+   **当前应固定的 SHA：`4fd33ae34c9e2cc6d1b24ee4a8a12b9aa6aa2bb8`**（= tag `v0.1.0`）。该 commit 已随
+   `origin/task-bcb8b-exploration-thread-graph-core-pass-a` push 到 GitHub，所以 `github:` 形式可直接安装；
+   tag 本身未 push（`github:` 依赖走 SHA，不需要它）。本地联调仍可用 `npm link`。
 2. cline-kanban 提供：`explorationId = workspaceTaskId`；`sessions[]`（主会话在前；每条含 `nativeSessionId` / `transcriptPath` / `workingDirectory` / `launchArgvTemplate{model, appendSystemPrompt, settingsPath, extraArgs}` / by-the-way 的 `forkedFromParentSessionTurnNumber`）；`storeRoot`；触发时机（Stop 边沿 + 防抖 + 每 exploration 并发 1）。
-   注（R1 实测修正）：`launchArgvTemplate` 仍**原样回传**，但它在 Claude Code 上**不再是 cache 命中的前提**——`--append-system-prompt` 在 `--resume` 时根本不参与，且 fork 因 [#77306](https://github.com/anthropics/claude-code/issues/77306) 恒不命中主会话 cache（详见 A.6）。逐字回传的理由变成「决定分身行为」与「dsh 侧仍需要」，宿主侧无需为此改动。
+   注（R1 实测修正）：`launchArgvTemplate` 仍**原样回传**，但它在 Claude Code 上**不再是 cache 命中的前提**——`--append-system-prompt` 不参与 `--resume` 的 cache 前缀（只测了 cache 这一维，它仍决定分身行为），且 fork 因 [#77306](https://github.com/anthropics/claude-code/issues/77306) 在**重型会话**上恒不命中主会话 cache（轻量会话仍可能命中，分档实测见 A.6）。逐字回传的理由变成「决定分身行为」与「dsh 侧仍需要」，宿主侧无需为此改动。
 3. 本包保证：作业 fork 进程 env 含 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`，并**删掉宿主注入的 `CLAUDE_CODE_*` / `CLAUDECODE` 内部变量**（见 A.6，否则分身不落盘 transcript）；作业不写宿主任何文件，只写 `storeRoot`；所有写入经漏斗；`ForkedWorkBranchResult.usage` 回报 cache 读量。
 4. 变更协议：改 schema 必 bump `EXPLORATION_THREAD_GRAPH_SCHEMA_VERSION` 并在 `CHANGELOG.md` 记；cline-kanban 升级 = 换 SHA。
+5. **RVF strict 轮之后的公开 API 增量**（B.2 编码时必须按这一版，不要按 `a2e1ae0` 那份被废弃的快照）：
+   - **破坏性**：`applyExplorationThreadGraphMaintenanceProposal` 入参新增**必填** `turnsUnderJudgement`
+     （`{ conversationSessionId, turnNumber }[]`，闸 6 拿它校验 placements 恰好覆盖待判范围）。
+     **只有直接调漏斗的宿主受影响**；走 `runExplorationThreadGraphMaintenanceJob` 的不受影响——
+     推荐 cline-kanban 走后者，除此之外没有理由直接碰漏斗。
+   - `ExplorationThreadGraphApplyRejectionReason` 新增**恰好三个**取值：`duplicate_temporary_id_within_proposal`、
+     `placement_missing_for_turn_under_judgement`、`placement_outside_turns_under_judgement`；
+     对该 union 做**穷举 switch** 的消费方要补这三个分支。
+   - `ExplorationThreadGraphStoreMutator` 返回类型放宽为可返回 `Promise`（既有同步 mutator 不受影响）。
+   - `BoundedJsonLinesReadResult` 新增 `appendedBytesRemainBeyondIncrementalReadBudget`：
+     为 true 时说明**还有追加内容没读完**，直接用 reader 的调用方必须循环读到它为 false，
+     否则拿到的 turn 序列末尾会缺若干 turn（读窗口起点恒不跳字节，所以**不会**「从中段重编号」——
+     那是 RVF 修掉的旧缺陷）。走 `ClaudeCodeTranscriptCompletedTurnSource` 或维护作业的宿主不必自己处理，
+     它内部已经循环到读完。
+   - 新增导出 `resolveExplorationThreadGraphStoreWriteLockPath`（跨进程写锁文件位置，宿主备份 /
+     体检 / 清理 `storeRoot` 时要认得它）、`DEFAULT_CLAUDE_EXECUTABLE_PATH`。
+   - 行为变更：本机没装 `claude` 时 CLI `doctor` 返回 **exit 1**（此前会误报通过）。
+   - store 现在除进程内写队列外还有**跨进程锁文件**（`O_CREAT|O_EXCL` + 15s 陈旧回收、20s 等锁上限）。
+     宿主若把 `maintain` 挂在 Stop hook 上，多个 CLI 进程并发不再丢写；但也意味着
+     `storeRoot` 里会出现一个 `.lock` 文件，备份与清理逻辑要放过它。
 
 ## A.14 假设与风险（接手时知道即可）
 
 - 假设：修订窗口 k=3；fork 用 `--session-id` 固定并登记，jsonl 不删；fork 与主会话同 model（吃 cache），提供「便宜模型不吃 cache」配置；不发布 npm；Codex harness 副作用核实后再定。
 - 风险（R1 实测后更新）：
-  - ~~cache 命中率~~ → **已定性：Claude Code 上恒不命中**（#77306，无 ETA）。代理透传与账号轮换都已排除（ccflare 单账号 session 策略、cache 头正常透传）。
+  - ~~cache 命中率~~ → **已定性：Claude Code 的重型会话恒不命中**（#77306，无 ETA；轻量会话可命中，见 A.6 分档表——别拿轻量复现去推翻重型结论）。代理透传与账号轮换都已排除（ccflare 单账号 session 策略、cache 头正常透传）。
   - `--json-schema` 输出字段名 → **已确认为 `structured_output`**；退路（prompt 要求纯 JSON + zod 校验）也实测可用，不传 schema 时模型照样回干净 JSON。
-  - **成本：实测 $2.2–$2.4/次 @220k 上下文**（原估 $0.3 偏乐观约 8 倍），且随上下文线性增长。opt-in + `minimumTurnsBetweenMaintenanceRuns` 是唯一缓解手段，宿主侧默认值要保守。
+  - **成本：实测 $2.2–$2.4/次 @220k 上下文**（原估 $0.3 偏乐观约 8 倍），且随上下文线性增长。在维持「同 model fork 主会话」的前提下，opt-in + `minimumTurnsBetweenMaintenanceRuns` 是**宿主侧**唯一的缓解手段，默认值要保守。
   - dsh 漂移（peer 钉 rc，smoke 不进主路径）；transcript 格式漂移（解析失败降级为 unavailable + 置信度标注，不炸）。
