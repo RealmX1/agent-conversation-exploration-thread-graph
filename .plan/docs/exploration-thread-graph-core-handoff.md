@@ -56,7 +56,7 @@ cline-kanban 的 Exploratory Mode（M0–M2）已落地「session map + findings
 | 阶段 | Pass A（本仓库） | Pass B（cline-kanban b04a4） |
 |---|---|---|
 | 并行期 | R0→R4 **全部已完成** + RVF strict 轮已收口 | 原生会话身份捕获；删旧 map 链；指令改探索礼仪；hooks 的作业 env 短路 + PreToolUse deny |
-| 交接点 1 | **已完成**：tag `v0.1.0` → `4fd33ae`，task branch 已 push 到 origin；`/core` `/harness-claude-code` API 冻结 | 加依赖、触发胶水、WS、trpc、面板 |
+| 交接点 1 | **已完成**：代码冻结在 `4fd33ae`，tag `v0.1.0` 落在其后的文档提交上，task branch 已 push 到 origin；`/core` `/harness-claude-code` API 冻结 | 加依赖、触发胶水、WS、trpc、面板 |
 | 交接点 2 | R4 dsh smoke 适配 | 验证与收尾 |
 
 契约（A.13）是两个 pass 唯一的共享真相；任何一方要改契约，先改 A.13 再改代码。
@@ -300,9 +300,9 @@ topicRegistry (per storeRoot) = { schemaVersion, topics: explorationTopic[] }
 | R1 core | 已完成 | schema / 文件 store / apply 漏斗（10 道闸）/ projection view / lane 布局 |
 | R2 Claude Code harness | 已完成 | transcript 增量投影 / 记录判别器 / fork 执行器 / 脱敏 fixture |
 | R3 维护作业 + CLI | 已完成 | prompt 组装 / zod→JSON Schema / 作业编排 / `maintain get schema doctor` |
-| R4 dsh smoke | 已完成 | `apply(ctx)` / subagent fork 执行器 / 会话日志纯 fold |
+| R4 dsh smoke | 部分完成 | `apply(ctx)` **只**注册 turn 快照 projection；fork 执行器已实现但单独导出、不参与注册；④ 触发与 ⑤ 图 projection / store 写入未接（见 A.8 补记） |
 | RVF strict 轮 | 已完成 | 双评审 14 条 canonical issue（5 high）全部修复 |
-| tag `v0.1.0` | 已打 | 指向 `4fd33ae`，**已 push 到 origin** 的 task branch 上 |
+| tag `v0.1.0` | 已打（未 push） | 指向 `4fd33ae` **之后**那笔文档提交；该提交与 `4fd33ae` 都在**已 push 到 origin** 的 task branch 上 |
 
 `npm run check` 全绿：**108 单测通过 + 1 opt-in 集成测试**（真实 `claude` fork，需 env 开关）。
 Codex harness（`/harness-codex`）**未做**——R3 内它一直是可选项，`codex exec resume` 是否写回同一 rollout 也仍未核实。
@@ -311,9 +311,13 @@ dsh 插件只做到 smoke（无 UI、不引 `@deepseek-ai/*` 依赖），未在 
 ## A.13 与 cline-kanban 的契约（两个 pass 的共享真相）
 
 1. cline-kanban 依赖 `github:RealmX1/agent-conversation-exploration-thread-graph#<sha>`，`import` 子路径 `/core` 与 `/harness-claude-code`；web-ui 只 import `/core` 的**类型与纯函数**（projection view 类型、`layoutThreadGraphLanes`）。
-   **当前应固定的 SHA：`4fd33ae34c9e2cc6d1b24ee4a8a12b9aa6aa2bb8`**（= tag `v0.1.0`）。该 commit 已随
-   `origin/task-bcb8b-exploration-thread-graph-core-pass-a` push 到 GitHub，所以 `github:` 形式可直接安装；
+   **当前应固定的 SHA：`4fd33ae34c9e2cc6d1b24ee4a8a12b9aa6aa2bb8`**——代码冻结在这一笔；其后的提交只改
+   `.plan/` 与 `AGENTS.md`（`src/` / `test/` / `package.json` 零改动），钉分支顶端装到的包与它完全相同。
+   tag `v0.1.0` 指向顶端那笔文档提交而非 `4fd33ae`，理由是 tag 该落在「代码对、文档也对」的一版。
+   两者都已随 `origin/task-bcb8b-exploration-thread-graph-core-pass-a` push 到 GitHub，`github:` 形式可直接安装；
    tag 本身未 push（`github:` 依赖走 SHA，不需要它）。本地联调仍可用 `npm link`。
+   注意 `package.json` 的 `files` 只含 `dist` / `README.md` / `CONTEXT.md`——`.plan/` 下的 handoff 与完工交接
+   **不进 npm 包**，要读得直接看仓库。
 2. cline-kanban 提供：`explorationId = workspaceTaskId`；`sessions[]`（主会话在前；每条含 `nativeSessionId` / `transcriptPath` / `workingDirectory` / `launchArgvTemplate{model, appendSystemPrompt, settingsPath, extraArgs}` / by-the-way 的 `forkedFromParentSessionTurnNumber`）；`storeRoot`；触发时机（Stop 边沿 + 防抖 + 每 exploration 并发 1）。
    注（R1 实测修正）：`launchArgvTemplate` 仍**原样回传**，但它在 Claude Code 上**不再是 cache 命中的前提**——`--append-system-prompt` 不参与 `--resume` 的 cache 前缀（只测了 cache 这一维，它仍决定分身行为），且 fork 因 [#77306](https://github.com/anthropics/claude-code/issues/77306) 在**重型会话**上恒不命中主会话 cache（轻量会话仍可能命中，分档实测见 A.6）。逐字回传的理由变成「决定分身行为」与「dsh 侧仍需要」，宿主侧无需为此改动。
 3. 本包保证：作业 fork 进程 env 含 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB=1`，并**删掉宿主注入的 `CLAUDE_CODE_*` / `CLAUDECODE` 内部变量**（见 A.6，否则分身不落盘 transcript）；作业不写宿主任何文件，只写 `storeRoot`；所有写入经漏斗；`ForkedWorkBranchResult.usage` 回报 cache 读量。

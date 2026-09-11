@@ -12,20 +12,22 @@
 
 | 项 | 值 |
 | --- | --- |
-| SHA（B.2 该固定的） | `4fd33ae34c9e2cc6d1b24ee4a8a12b9aa6aa2bb8` |
-| tag | `v0.1.0` → 上面这个 SHA（**未 push**，`github:` 依赖走 SHA 不需要它） |
-| 已 push 的 ref | `origin/task-bcb8b-exploration-thread-graph-core-pass-a` |
-| 本地 base | `main` 已 ff 到同一 commit；`origin/main` 仍在 `4def9c5`（按规则不 push base） |
+| SHA（B.2 该固定的） | `4fd33ae34c9e2cc6d1b24ee4a8a12b9aa6aa2bb8`——**代码冻结在这一笔**。其后的提交只动 `.plan/` 与 `AGENTS.md`，`src/` / `test/` / `package.json` 一字未改，所以钉它与钉分支顶端装到的包完全相同 |
+| tag | `v0.1.0` → **分支顶端那笔文档提交**，不是 `4fd33ae`（tag 该落在「代码对、文档也对」的那一版；未 push，`github:` 依赖走 SHA 不需要它） |
+| 已 push 的 ref | `origin/task-bcb8b-exploration-thread-graph-core-pass-a`，与本地 `main` 同步推进 |
+| 本地 base | `main` 已 ff 到分支顶端；`origin/main` 仍在 `4def9c5`（按规则不 push base） |
 | 检查链 | `npm run check` 全绿：**108 通过 + 1 跳过**。跳过那条是真实 `claude` fork 的 opt-in 集成（env 开关控制），检查链默认不覆盖它 |
 | 包版本 | `package.json` 的 `version` 仍是 `0.0.0`——tag 名不等于包版本。`github:` 依赖按 SHA 解析，不受影响，但别把它当版本号读 |
 
-commit 链：`4def9c5` R0 脚手架 → `a2e1ae0` R1–R4 → `7005949` RVF 修复 14 条 → `4fd33ae` Serena 配置。
+commit 链：`4def9c5` R0 脚手架 → `a2e1ae0` R1–R4 → `7005949` RVF 修复 14 条 → `4fd33ae` Serena 配置
+→ 其后若干笔**纯文档**提交（本文所在，tag `v0.1.0` 落在最新一笔）。
 
 **`a2e1ae0` 是废弃快照**，别引它：它有 5 个 high 缺陷，且公开 API 与最终版**不兼容**。
 同名 tag 曾指向它，现已移到 `4fd33ae`。
 
-**注意：这两份文档本身不在 `4fd33ae` 里。** 本文未跟踪，计划与 `AGENTS.md` 的本轮修订也未提交，
-且 `package.json` 的 `files` 不含 `.plan/`。B.2 只钉 SHA 拿不到它们——要么单独传阅这两份，要么等这几笔提交后换 SHA。
+**这两份文档怎么取**：它们在 `4fd33ae` **之后**的文档提交里（tag `v0.1.0` / task branch 顶端），
+`4fd33ae` 本身没有。另外 `package.json` 的 `files` 只含 `dist` / `README.md` / `CONTEXT.md`——
+`.plan/` **不进 npm 包**，所以 B.2 装出来的依赖目录里找不到它们，只能从仓库读。
 
 ## 2. 三条实测结论推翻了计划的前提
 
