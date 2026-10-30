@@ -1,7 +1,7 @@
 // dsh smoke（handoff A.8）：只验证三处边界对得上，不做 UI。
 // 用 dsh 会话日志形状的夹具事件跑一遍纯 fold，并把 executor 与 projection 注册接上假 ctx。
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ConversationSessionRef, ForkedWorkBranchRequest, ObjectRootedJsonSchema } from "../../src/core/index.js";
 import {
 	apply,
@@ -129,7 +129,7 @@ describe("dsh subagent 执行器", () => {
 	const dshSessionRef: ConversationSessionRef = { harnessKind: "dsh", nativeSessionId: DSH_SESSION_ID };
 
 	function buildRequest(): ForkedWorkBranchRequest {
-		return { parentSession: dshSessionRef, promptText: "判定归属", outputSchema, timeoutMs: 1000 };
+		return { parentSession: dshSessionRef, promptText: "判定归属", outputSchema };
 	}
 
 	it("用 provider=fork 起子代理，并把 structured / usage 映射回本包形状", async () => {
@@ -166,20 +166,44 @@ describe("dsh subagent 执行器", () => {
 		expect(result.stopReason).toBe("error");
 	});
 
-	it("provider 永不 settle 时按 timeoutMs 兜底回 timeout，并向 provider 发取消信号", async () => {
-		let observedAbortSignal: AbortSignal | undefined;
-		const subagents: DshSubagentRegistry = {
-			start(request) {
-				observedAbortSignal = request.signal;
-				return new Promise<never>(() => {});
-			},
-		};
-		const result = await new DshSubagentForkedWorkBranchExecutor(subagents).start({
-			...buildRequest(),
-			timeoutMs: 5,
-		});
-		expect(result.stopReason).toBe("timeout");
-		expect(observedAbortSignal?.aborted).toBe(true);
+	it("provider 跨越旧 300 秒阈值仍可正常完成，显式取消才发送 AbortSignal", async () => {
+		vi.useFakeTimers();
+		try {
+			let observedAbortSignal: AbortSignal | undefined;
+			let complete: ((result: { stopReason: string; output: string }) => void) | undefined;
+			const subagents: DshSubagentRegistry = {
+				start(request) {
+					observedAbortSignal = request.signal;
+					return new Promise((resolve) => {
+						complete = resolve;
+					});
+				},
+			};
+			const pending = new DshSubagentForkedWorkBranchExecutor(subagents).start(buildRequest());
+			await vi.advanceTimersByTimeAsync(300_001);
+			expect(observedAbortSignal?.aborted).toBe(false);
+			complete?.({ stopReason: "completed", output: "完成" });
+			expect((await pending).stopReason).toBe("completed");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("provider 忽略显式取消时只报告取消确认未知", async () => {
+		vi.useFakeTimers();
+		try {
+			const cancellation = new AbortController();
+			const subagents: DshSubagentRegistry = { start: () => new Promise(() => {}) };
+			const pending = new DshSubagentForkedWorkBranchExecutor(subagents).start({
+				...buildRequest(),
+				signal: cancellation.signal,
+			});
+			cancellation.abort();
+			await vi.advanceTimersByTimeAsync(5_001);
+			expect(await pending).toMatchObject({ stopReason: "cancelled", cancellationConfirmation: "unknown" });
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("调用方的取消信号照样传到 provider", async () => {

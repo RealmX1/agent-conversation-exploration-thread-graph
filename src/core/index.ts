@@ -83,6 +83,7 @@ export {
 
 export type {
 	ForkedWorkBranchExecutor,
+	ForkedWorkBranchProcessObservation,
 	ForkedWorkBranchRequest,
 	ForkedWorkBranchResult,
 	ForkedWorkBranchStopReason,
@@ -99,7 +100,6 @@ export type {
 } from "./maintenance-job/exploration-thread-graph-maintenance-job.js";
 export {
 	DEFAULT_MAINTENANCE_JOB_BATCH_SIZE,
-	DEFAULT_MAINTENANCE_JOB_TIMEOUT_MILLISECONDS,
 	runExplorationThreadGraphMaintenanceJob,
 } from "./maintenance-job/exploration-thread-graph-maintenance-job.js";
 

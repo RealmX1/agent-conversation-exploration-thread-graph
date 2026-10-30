@@ -65,3 +65,8 @@
 
 - R0 脚手架：单包多入口（`./core` `./harness-claude-code` `./harness-codex` `./cli` `./dsh-plugin`）、`prepare` 构建、biome 2.5.12 / vitest 4 / tsc NodeNext 检查链、入口点 smoke 测试。
 - 契约常量：`EXPLORATION_THREAD_GRAPH_SCHEMA_VERSION = 1`；作业 env 变量名 `AGENT_CONVERSATION_EXPLORATION_WORK_BRANCH_JOB`。
+
+## Agent 总时长限制移除
+
+- 删除请求、维护入口与 CLI 的总预算，Claude 与 dsh 不再按墙钟终止分身。
+- 显式取消保留有界清理、启动身份核验和取消确认；通过进程观察回调支持宿主持久记录归属。

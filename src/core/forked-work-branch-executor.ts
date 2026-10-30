@@ -22,8 +22,14 @@ export interface ForkedWorkBranchRequest {
 	parentSession: ConversationSessionRef;
 	promptText: string;
 	outputSchema: ObjectRootedJsonSchema;
-	timeoutMs: number;
 	signal?: AbortSignal;
+	/** 宿主须在派发前持久保存；只能作为正向归属证据，缺席不是退出证明。 */
+	executionOwnershipToken?: string;
+	/** 内置进程执行器在调用并等待该屏障之前绝不 spawn。 */
+	beforeProcessSpawn?: () => Promise<void>;
+
+	/** 原生进程归属观察；宿主可持久保存，查询缺证保持 null。 */
+	onProcessObservation?: (observation: ForkedWorkBranchProcessObservation) => void;
 }
 
 export type ForkedWorkBranchStopReason = "completed" | "error" | "timeout" | "cancelled";
@@ -36,11 +42,24 @@ export interface ForkedWorkBranchUsage {
 	costUsd?: number;
 }
 
+export interface ForkedWorkBranchProcessObservation {
+	executionOwnershipToken: string;
+	processPid: number;
+	processStartIdentity: string | null;
+	ownedDescendantStartIdentities: Record<string, string>;
+	observedAtEpochMs: number;
+	lastOutputActivityAtEpochMs: number | null;
+}
+
 export interface ForkedWorkBranchResult {
 	/** 满足 outputSchema 时存在；不满足或解析失败时缺席，由调用方按 rejected 处理。 */
 	structured?: unknown;
 	outputText: string;
 	stopReason: ForkedWorkBranchStopReason;
+	/** 原生进程入口的派发事实；失败但未 spawn 可安全恢复。 */
+	localProcessLaunchStatus?: "not_started" | "started";
+	/** 仅在显式取消时存在：Claude 核验本地进程及后代，dsh 核验 provider 的原生结束回执；不证明远端服务取消。 */
+	cancellationConfirmation?: "confirmed" | "unknown" | "not_started";
 	usage?: ForkedWorkBranchUsage;
 	/** 分身自己的原生 session id，仅供审计；本包不删它的 jsonl。 */
 	forkedNativeSessionId?: string;

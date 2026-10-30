@@ -143,7 +143,7 @@ interface ForkedWorkBranchRequest {
 	parentSession: ConversationSessionRef;
 	promptText: string;
 	outputSchema: ObjectJsonSchema;      // object-rooted JSON Schema
-	timeoutMs: number; signal?: AbortSignal;
+	signal?: AbortSignal; // 没有 Agent 总运行时限
 }
 interface ForkedWorkBranchResult {
 	structured?: unknown;                // 满足 outputSchema 时存在

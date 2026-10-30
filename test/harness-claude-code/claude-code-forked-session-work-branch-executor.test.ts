@@ -43,7 +43,6 @@ function buildRequest(sessionRef: ConversationSessionRef = buildSessionRef()): F
 		parentSession: sessionRef,
 		promptText: "判定归属并只输出 JSON",
 		outputSchema: OUTPUT_SCHEMA,
-		timeoutMs: 1000,
 	};
 }
 

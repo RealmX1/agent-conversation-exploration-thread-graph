@@ -51,36 +51,57 @@ export class DshSubagentForkedWorkBranchExecutor implements ForkedWorkBranchExec
 				`DshSubagentForkedWorkBranchExecutor 只处理 dsh 会话，收到 ${request.parentSession.harnessKind}`,
 			);
 		}
-		// timeoutMs 是 ForkedWorkBranchRequest 对**所有** harness 的承诺（Claude Code 那侧靠 SIGTERM 兑现）。
-		// dsh 的 provider 只是一个 Promise：它若永不 settle，维护作业就永久挂住，
-		// 所以这里既要自己竞速兜底回 timeout，也要把取消信号真的送到 provider（而不是丢下它继续跑）。
+		if (request.signal?.aborted) {
+			return { outputText: "派发前已取消", stopReason: "cancelled", cancellationConfirmation: "not_started" };
+		}
 		const subagentAbortController = new AbortController();
+		let cancellationGraceTimer: ReturnType<typeof setTimeout> | undefined;
+		let resolveUnconfirmedCancellation: (result: ForkedWorkBranchResult) => void = () => {};
+		const cancellationPromise = new Promise<ForkedWorkBranchResult>((resolve) => {
+			resolveUnconfirmedCancellation = resolve;
+		});
 		const forwardCallerAbortToSubagent = (): void => {
 			subagentAbortController.abort();
+			// 只限制取消确认的等待；provider 没确认时明确保留未知。
+			cancellationGraceTimer = setTimeout(
+				() =>
+					resolveUnconfirmedCancellation({
+						outputText: "已向 provider 请求取消，尚未取得停止确认",
+						stopReason: "cancelled",
+						cancellationConfirmation: "unknown",
+					}),
+				5_000,
+			);
 		};
-		if (request.signal !== undefined) {
-			if (request.signal.aborted) subagentAbortController.abort();
-			else request.signal.addEventListener("abort", forwardCallerAbortToSubagent, { once: true });
-		}
-
-		let subagentStartTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
-		const subagentStartPromise = this.startSubagentAndMapResult(request, subagentAbortController.signal);
-		// 超时先 settle 之后 provider 才失败时，这条 rejection 已经没人接：先接住，免得炸成 unhandledRejection。
-		subagentStartPromise.catch(() => {});
-		const timeoutFallbackPromise = new Promise<ForkedWorkBranchResult>((resolve) => {
-			subagentStartTimeoutHandle = setTimeout(() => {
-				subagentAbortController.abort();
-				resolve({
-					outputText: `dsh 子代理在 ${request.timeoutMs}ms 内没有回结果，已按超时终止并向 provider 发出取消信号`,
-					stopReason: "timeout",
-				});
-			}, request.timeoutMs);
-		});
-
+		request.signal?.addEventListener("abort", forwardCallerAbortToSubagent, { once: true });
 		try {
-			return await Promise.race([subagentStartPromise, timeoutFallbackPromise]);
+			return await Promise.race([
+				this.startSubagentAndMapResult(request, subagentAbortController.signal)
+					.then((result) =>
+						subagentAbortController.signal.aborted
+							? {
+									outputText: result.outputText,
+									stopReason: "cancelled" as const,
+									cancellationConfirmation: "confirmed" as const,
+									...(result.forkedNativeSessionId
+										? { forkedNativeSessionId: result.forkedNativeSessionId }
+										: {}),
+								}
+							: result,
+					)
+					.catch(
+						(error: unknown): ForkedWorkBranchResult => ({
+							outputText: error instanceof Error ? error.message : String(error),
+							stopReason: subagentAbortController.signal.aborted ? "cancelled" : "error",
+							...(subagentAbortController.signal.aborted
+								? { cancellationConfirmation: "unknown" as const }
+								: {}),
+						}),
+					),
+				cancellationPromise,
+			]);
 		} finally {
-			clearTimeout(subagentStartTimeoutHandle);
+			clearTimeout(cancellationGraceTimer);
 			request.signal?.removeEventListener("abort", forwardCallerAbortToSubagent);
 		}
 	}

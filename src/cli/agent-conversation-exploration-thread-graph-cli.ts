@@ -50,7 +50,7 @@ export function renderAgentConversationExplorationThreadGraphCliUsage(): string 
 		"  maintain   对一个 exploration 跑一次 work-branch 维护作业",
 		"             --exploration-id <id> --store-root <dir> --mode incremental|initial_backfill",
 		"             --session <ConversationSessionRef JSON>（可重复，主会话在前）或 --sessions-file <path>",
-		"             [--model <argv 字面值，覆盖宿主模板>] [--batch-size <n>] [--timeout-ms <n>]",
+		"             [--model <argv 字面值，覆盖宿主模板>] [--batch-size <n>]",
 		"             [--final-turn-completed]（由 Stop 边沿触发时给上，末 turn 才算已完成）",
 		"  get        输出 exploration 的 collection 或 projection view",
 		"             --exploration-id <id> --store-root <dir> [--view] [--session <json>...]",
@@ -256,7 +256,6 @@ async function resolveSessionRefs(parsed: ParsedCliArguments): Promise<Conversat
  * `setTimeout` 能表达的最大毫秒数（32 位有符号上限）。超过它 Node 会把延时**压回 1ms**，
  * 症状与 NaN 一模一样——分身刚起来就被 SIGTERM 秒杀——所以一并挡在 CLI 边界。
  */
-const MAXIMUM_SUPPORTED_FORK_TIMEOUT_MILLISECONDS = 2_147_483_647;
 
 /**
  * 把数值型参数解析成正整数。刻意用 `Number` 而不是 `Number.parseInt`：
@@ -291,30 +290,37 @@ async function runMaintainSubcommand(
 	const batchSizeOrError =
 		batchSizeText === null ? null : parsePositiveIntegerFlag("--batch-size", batchSizeText, Number.MAX_SAFE_INTEGER);
 	if (typeof batchSizeOrError === "string") return failure(batchSizeOrError);
-	const timeoutText = readSingleFlag(parsed, "timeout-ms");
-	const timeoutMillisecondsOrError =
-		timeoutText === null
-			? null
-			: parsePositiveIntegerFlag("--timeout-ms", timeoutText, MAXIMUM_SUPPORTED_FORK_TIMEOUT_MILLISECONDS);
-	if (typeof timeoutMillisecondsOrError === "string") return failure(timeoutMillisecondsOrError);
+	if (parsed.flags.has("timeout-ms") || parsed.booleanFlags.has("timeout-ms")) {
+		return failure("--timeout-ms 已移除；Agent 没有总运行时限，使用显式取消停止作业。");
+	}
 
 	const sessionRefsOrError = await resolveSessionRefs(parsed);
 	if (typeof sessionRefsOrError === "string") return failure(sessionRefsOrError);
 
 	const overrideModel = readSingleFlag(parsed, "model");
 
-	const result = await runExplorationThreadGraphMaintenanceJob({
-		explorationId,
-		sessions: sessionRefsOrError,
-		turnSource: new ClaudeCodeTranscriptCompletedTurnSource({
-			treatFinalTurnAsCompleted: parsed.booleanFlags.has("final-turn-completed"),
-		}),
-		executor: new ClaudeCodeForkedSessionWorkBranchExecutor(overrideModel === null ? {} : { overrideModel }),
-		storeRoot,
-		mode,
-		...(batchSizeOrError === null ? {} : { batchSize: batchSizeOrError }),
-		...(timeoutMillisecondsOrError === null ? {} : { timeoutMs: timeoutMillisecondsOrError }),
-	});
+	const cancellationController = new AbortController();
+	const cancel = (): void => cancellationController.abort();
+	process.once("SIGINT", cancel);
+	process.once("SIGTERM", cancel);
+	let result: Awaited<ReturnType<typeof runExplorationThreadGraphMaintenanceJob>>;
+	try {
+		result = await runExplorationThreadGraphMaintenanceJob({
+			explorationId,
+			sessions: sessionRefsOrError,
+			turnSource: new ClaudeCodeTranscriptCompletedTurnSource({
+				treatFinalTurnAsCompleted: parsed.booleanFlags.has("final-turn-completed"),
+			}),
+			executor: new ClaudeCodeForkedSessionWorkBranchExecutor(overrideModel === null ? {} : { overrideModel }),
+			storeRoot,
+			mode,
+			...(batchSizeOrError === null ? {} : { batchSize: batchSizeOrError }),
+			signal: cancellationController.signal,
+		});
+	} finally {
+		process.removeListener("SIGINT", cancel);
+		process.removeListener("SIGTERM", cancel);
+	}
 	return result.outcome === "accepted" || result.outcome === "skipped"
 		? success({ ok: true, ...result })
 		: { exitCode: 1, output: JSON.stringify({ ok: false, ...result }, null, "\t") };

@@ -27,3 +27,13 @@ export {
 	readTranscriptRecordTimestamp,
 	readUserMessageText,
 } from "./claude-code-transcript-record-classifier.js";
+
+export {
+	confirmOwnedProcessCancellation,
+	extendOwnedProcessStartIdentities,
+	FORKED_WORK_BRANCH_EXECUTION_OWNERSHIP_ENVIRONMENT_KEY,
+	observeExecutionOwnedProcesses,
+	readNativeProcessOwnershipSnapshot,
+	readNativeSystemBootIdentity,
+	signalMatchingOwnedProcesses,
+} from "./forked-work-branch-process-ownership.js";

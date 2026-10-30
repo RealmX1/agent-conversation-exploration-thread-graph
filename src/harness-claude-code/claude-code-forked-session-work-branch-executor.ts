@@ -22,6 +22,14 @@ import {
 	type ForkedWorkBranchUsage,
 	INHERITED_HOST_CLAUDE_CODE_ENV_VARIABLE_NAMES,
 } from "../core/index.js";
+import {
+	confirmOwnedProcessCancellation,
+	extendOwnedProcessStartIdentities,
+	FORKED_WORK_BRANCH_EXECUTION_OWNERSHIP_ENVIRONMENT_KEY,
+	observeExecutionOwnedProcesses,
+	readNativeProcessOwnershipSnapshot,
+	signalMatchingOwnedProcesses,
+} from "./forked-work-branch-process-ownership.js";
 
 /** 会绕过宿主 hooks 的参数：出现即拒绝执行（契约 A.13-3 的前提）。 */
 const FORBIDDEN_LAUNCH_ARGUMENTS = ["--bare", "--safe-mode"];
@@ -150,14 +158,41 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 				`ClaudeCodeForkedSessionWorkBranchExecutor 只处理 claude_code 会话，收到 ${parentSession.harnessKind}`,
 			);
 		}
+		if (request.signal?.aborted) {
+			return {
+				outputText: "派发前已取消",
+				stopReason: "cancelled",
+				cancellationConfirmation: "not_started",
+				localProcessLaunchStatus: "not_started",
+			};
+		}
 		const forkedSessionId = randomUUID();
 		const launchArguments = this.buildLaunchArguments(request, forkedSessionId);
+		const executionOwnershipToken = request.executionOwnershipToken ?? randomUUID();
+		if (!/^[a-zA-Z0-9-]{32,128}$/u.test(executionOwnershipToken)) throw new Error("执行归属 token 格式无效");
+		await request.beforeProcessSpawn?.();
+		if (request.signal?.aborted)
+			return {
+				outputText: "派发屏障等待期间已取消",
+				stopReason: "cancelled",
+				cancellationConfirmation: "not_started",
+				localProcessLaunchStatus: "not_started",
+			};
+		const environment = this.buildChildProcessEnvironment(process.env);
+		environment[FORKED_WORK_BRANCH_EXECUTION_OWNERSHIP_ENVIRONMENT_KEY] = [
+			environment[FORKED_WORK_BRANCH_EXECUTION_OWNERSHIP_ENVIRONMENT_KEY],
+			executionOwnershipToken,
+		]
+			.filter(Boolean)
+			.join(":");
+		const executionStartedAtEpochMs = Date.now();
 
 		return await new Promise<ForkedWorkBranchResult>((resolve) => {
 			const child = spawn(this.claudeExecutablePath, launchArguments, {
 				cwd: parentSession.workingDirectory,
-				env: this.buildChildProcessEnvironment(process.env),
+				env: environment,
 				stdio: ["ignore", "pipe", "pipe"],
+				detached: process.platform !== "win32",
 			});
 
 			let stdoutText = "";
@@ -165,44 +200,147 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 			let stopReasonOverride: ForkedWorkBranchStopReason | null = null;
 			let settled = false;
 
-			const timeoutHandle = setTimeout(() => {
-				stopReasonOverride = "timeout";
-				child.kill("SIGTERM");
-			}, request.timeoutMs);
-
+			const ownedProcessStartIdentities = new Map<number, string>();
+			let lastOutputActivityAtEpochMs: number | null = null;
+			let processExitConfirmed = false;
+			let cancellationEscalationTimer: ReturnType<typeof setTimeout> | undefined;
+			let cancellationConfirmationTimer: ReturnType<typeof setTimeout> | undefined;
+			let observationInFlight: Promise<void> | null = null;
+			const observeOwnership = (): Promise<void> => {
+				if (settled) return Promise.resolve();
+				if (observationInFlight) return observationInFlight;
+				observationInFlight = (async () => {
+					if (!child.pid) return;
+					try {
+						extendOwnedProcessStartIdentities(
+							await readNativeProcessOwnershipSnapshot(),
+							child.pid,
+							ownedProcessStartIdentities,
+						);
+					} catch {
+						// 缺证保留未知，下一次观察自动重验。
+					}
+					if (settled) return;
+					try {
+						request.onProcessObservation?.({
+							executionOwnershipToken,
+							processPid: child.pid,
+							processStartIdentity: ownedProcessStartIdentities.get(child.pid) ?? null,
+							ownedDescendantStartIdentities: Object.fromEntries(
+								[...ownedProcessStartIdentities].filter(([pid]) => pid !== child.pid),
+							),
+							observedAtEpochMs: Date.now(),
+							lastOutputActivityAtEpochMs,
+						});
+					} catch {
+						// 宿主观察出口失败不终止角色；持久缺证由宿主下一次观察补齐。
+					}
+				})().finally(() => {
+					observationInFlight = null;
+				});
+				return observationInFlight;
+			};
+			const ownershipObservationTimer = setInterval(() => {
+				void observeOwnership();
+			}, 250);
+			let descendantRecoveryInFlight: ReturnType<typeof observeExecutionOwnedProcesses> | null = null;
+			const recoverOwnedDescendants = (): ReturnType<typeof observeExecutionOwnedProcesses> => {
+				if (!descendantRecoveryInFlight) {
+					descendantRecoveryInFlight = observeExecutionOwnedProcesses({
+						executionOwnershipToken,
+						executionStartedAtEpochMs,
+						recordedStartIdentities: ownedProcessStartIdentities,
+					})
+						.then((recovered) => {
+							for (const [pid, identity] of recovered.ownedStartIdentities)
+								ownedProcessStartIdentities.set(pid, identity);
+							return recovered;
+						})
+						.catch(() => ({ ownedStartIdentities: new Map<number, string>(), hasUnprovenOrphanOwnership: true }))
+						.finally(() => {
+							descendantRecoveryInFlight = null;
+						});
+				}
+				return descendantRecoveryInFlight;
+			};
 			const onAbort = (): void => {
+				if (stopReasonOverride === "cancelled" || settled) return;
 				stopReasonOverride = "cancelled";
-				child.kill("SIGTERM");
+				if (!processExitConfirmed) child.kill("SIGTERM");
+				void observeOwnership()
+					.then(recoverOwnedDescendants)
+					.then(() => signalMatchingOwnedProcesses(ownedProcessStartIdentities, "SIGTERM"));
+				cancellationEscalationTimer = setTimeout(() => {
+					if (!processExitConfirmed) child.kill("SIGKILL");
+					void signalMatchingOwnedProcesses(ownedProcessStartIdentities, "SIGKILL");
+				}, 2_000);
+				cancellationConfirmationTimer = setTimeout(() => {
+					void signalMatchingOwnedProcesses(ownedProcessStartIdentities, "SIGKILL");
+					// 清理窗口到点不代表全树退出；close 的完整归属核验未完成时一律未知。
+					settle({
+						outputText: stderrText || stdoutText,
+						stopReason: "cancelled",
+						forkedNativeSessionId: forkedSessionId,
+						cancellationConfirmation: "unknown",
+					});
+					child.stdout.destroy();
+					child.stderr.destroy();
+					child.unref();
+				}, 5_000);
 			};
 			request.signal?.addEventListener("abort", onAbort, { once: true });
+			if (request.signal?.aborted) onAbort();
+			child.once("spawn", () => {
+				void observeOwnership();
+			});
+			child.once("exit", () => {
+				processExitConfirmed = true;
+			});
 
 			const settle = (result: ForkedWorkBranchResult): void => {
 				if (settled) return;
 				settled = true;
-				clearTimeout(timeoutHandle);
+				clearInterval(ownershipObservationTimer);
+				clearTimeout(cancellationEscalationTimer);
+				clearTimeout(cancellationConfirmationTimer);
 				request.signal?.removeEventListener("abort", onAbort);
 				resolve(result);
 			};
 
 			child.stdout.on("data", (chunk: Buffer) => {
 				stdoutText += chunk.toString("utf8");
+				lastOutputActivityAtEpochMs = Date.now();
 			});
 			child.stderr.on("data", (chunk: Buffer) => {
 				stderrText += chunk.toString("utf8");
+				lastOutputActivityAtEpochMs = Date.now();
 			});
 
 			child.on("error", (spawnError: Error) => {
 				settle({
 					outputText: `启动 ${this.claudeExecutablePath} 失败：${spawnError.message}`,
 					stopReason: "error",
+					localProcessLaunchStatus: child.pid ? "started" : "not_started",
 				});
 			});
 
-			child.on("close", (exitCode) => {
+			child.on("close", async (exitCode) => {
+				// 补查归属会让出执行权，取消资格必须在最后一次等待后重新核验。
+				await observeOwnership();
 				if (stopReasonOverride !== null) {
+					await recoverOwnedDescendants();
+					await confirmOwnedProcessCancellation(ownedProcessStartIdentities);
+					const finalOwnership = await recoverOwnedDescendants();
+					const cancellationConfirmation =
+						processExitConfirmed &&
+						!finalOwnership.hasUnprovenOrphanOwnership &&
+						finalOwnership.ownedStartIdentities.size === 0
+							? "confirmed"
+							: "unknown";
 					settle({
 						outputText: stderrText.trim() === "" ? stdoutText : stderrText,
 						stopReason: stopReasonOverride,
+						cancellationConfirmation,
 						forkedNativeSessionId: forkedSessionId,
 					});
 					return;
@@ -227,7 +365,7 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 					envelope.structured_output !== undefined
 						? envelope.structured_output
 						: extractJsonObjectFromOutputText(outputText);
-				const failed = envelope.is_error === true || (exitCode !== 0 && exitCode !== null);
+				const failed = envelope.is_error === true || exitCode !== 0;
 				settle({
 					...(structured !== undefined ? { structured } : {}),
 					outputText,

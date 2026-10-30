@@ -44,7 +44,6 @@ describe.skipIf(!integrationIsEnabled || parentNativeSessionId === "")("真实 c
 			promptText:
 				"你是本会话的分身，只输出 JSON，不要执行任何工具。数一下本会话到目前为止有多少个由真实用户输入开启的 turn。",
 			outputSchema: OUTPUT_SCHEMA,
-			timeoutMs: 300_000,
 		});
 
 		expect(result.stopReason).toBe("completed");

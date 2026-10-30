@@ -29,7 +29,6 @@ import {
 
 /** 单次作业最多判多少个 turn；backfill 超出时分批，由调用方按返回的 remaining 再跑。 */
 export const DEFAULT_MAINTENANCE_JOB_BATCH_SIZE = 40;
-export const DEFAULT_MAINTENANCE_JOB_TIMEOUT_MILLISECONDS = 300_000;
 
 export interface RunExplorationThreadGraphMaintenanceJobInput {
 	explorationId: string;
@@ -41,7 +40,6 @@ export interface RunExplorationThreadGraphMaintenanceJobInput {
 	mode: ExplorationThreadGraphMaintenanceJobMode;
 	revisionWindowTurnCount?: number;
 	batchSize?: number;
-	timeoutMs?: number;
 	signal?: AbortSignal;
 	now?: number;
 }
@@ -189,7 +187,6 @@ export async function runExplorationThreadGraphMaintenanceJob(
 		parentSession: primarySession,
 		promptText,
 		outputSchema: buildExplorationThreadGraphMaintenanceProposalJsonSchema(),
-		timeoutMs: input.timeoutMs ?? DEFAULT_MAINTENANCE_JOB_TIMEOUT_MILLISECONDS,
 		...(input.signal !== undefined ? { signal: input.signal } : {}),
 	});
 	const usage = toMaintenanceJobUsage(forkResult.usage);
