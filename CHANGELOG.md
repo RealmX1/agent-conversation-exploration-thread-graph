@@ -70,3 +70,11 @@
 
 - 删除请求、维护入口与 CLI 的总预算，Claude 与 dsh 不再按墙钟终止分身。
 - 显式取消保留有界清理、启动身份核验和取消确认；通过进程观察回调支持宿主持久记录归属。
+
+### 取消与原生归属修正
+
+- `beforeProcessSpawn` 持久化屏障未完成时，显式取消也及时返回 `cancelled/not_started`，屏障随后完成不再启动分身。
+- 取消期间持续补查 token 可证后代，不再将重新发现或清理绑定到根进程的 `close`；根进程早退时仍保留两秒 `SIGTERM` 优雅清理窗口，再必要升级 `SIGKILL`。每个已登记启动身份只尝试一次 `SIGTERM`，避免重复信号打断一次性清理 handler。
+- `processStartIdentity` 不再包含可变 PGID，避免 `setsid` / `setpgid` 被误判为退出；它仍是不透明值，消费方不得依赖内部格式。取消与恢复内部兼容旧版 PID + PGID + 启动时间记录，按 PID 与出生信息核对，不要求消费方丢弃旧记录或以 token 重建；无法核对格式时保留 `unknown`，出生信息变化时不发信号。旧版已确认记录在 token 缺席时仍可扩展后代。`extendOwnedProcessStartIdentities` 不再自动登记空表下的根 PID，调用方需先以 token 或已确认身份建立归属，避免首次观察前 PID 被复用后误杀。无新增公开 API 或实体 schema。
+- 新生且无法核验归属的进程，即使父进程仍存在（包括 Linux subreaper），也保留 `unknown`；仅排除可证的其他用户、服务管理器来源与只读查询自身，不凭父 PID 推断退出。
+- CLI 在整个取消清理期间持续接管重复 `SIGINT` / `SIGTERM`；维护作业在 fork 后、等待写锁及锁内重读后再次核验取消，不再接受或落盘已取消提案。复用既有 `fork_failed/cancelled` 结果；实体 schema 与版本不变。

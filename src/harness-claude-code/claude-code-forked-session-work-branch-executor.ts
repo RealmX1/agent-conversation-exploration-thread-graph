@@ -23,11 +23,8 @@ import {
 	INHERITED_HOST_CLAUDE_CODE_ENV_VARIABLE_NAMES,
 } from "../core/index.js";
 import {
-	confirmOwnedProcessCancellation,
-	extendOwnedProcessStartIdentities,
 	FORKED_WORK_BRANCH_EXECUTION_OWNERSHIP_ENVIRONMENT_KEY,
 	observeExecutionOwnedProcesses,
-	readNativeProcessOwnershipSnapshot,
 	signalMatchingOwnedProcesses,
 } from "./forked-work-branch-process-ownership.js";
 
@@ -170,7 +167,21 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 		const launchArguments = this.buildLaunchArguments(request, forkedSessionId);
 		const executionOwnershipToken = request.executionOwnershipToken ?? randomUUID();
 		if (!/^[a-zA-Z0-9-]{32,128}$/u.test(executionOwnershipToken)) throw new Error("执行归属 token 格式无效");
-		await request.beforeProcessSpawn?.();
+		if (request.signal) {
+			const signal = request.signal;
+			let onBarrierAbort!: () => void;
+			const aborted = new Promise<void>((resolveAbort) => {
+				onBarrierAbort = resolveAbort;
+			});
+			signal.addEventListener("abort", onBarrierAbort, { once: true });
+			try {
+				if (!signal.aborted) await Promise.race([Promise.resolve(request.beforeProcessSpawn?.()), aborted]);
+			} finally {
+				signal.removeEventListener("abort", onBarrierAbort);
+			}
+		} else {
+			await request.beforeProcessSpawn?.();
+		}
 		if (request.signal?.aborted)
 			return {
 				outputText: "派发屏障等待期间已取消",
@@ -205,21 +216,45 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 			let processExitConfirmed = false;
 			let cancellationEscalationTimer: ReturnType<typeof setTimeout> | undefined;
 			let cancellationConfirmationTimer: ReturnType<typeof setTimeout> | undefined;
+			let cancellationRequestedAtEpochMs: number | null = null;
+			const terminatedProcessStartIdentities = new Map<number, string>();
+			const signalOwnedProcessesForCancellation = async (signal: NodeJS.Signals): Promise<void> => {
+				if (settled) return;
+				let processesToSignal = ownedProcessStartIdentities;
+				if (signal === "SIGTERM") {
+					processesToSignal = new Map<number, string>();
+					for (const [pid, identity] of ownedProcessStartIdentities) {
+						// 根进程已由 ChildProcess 句柄接收一次 TERM，不再从归属表重复发送。
+						if (pid === child.pid || terminatedProcessStartIdentities.get(pid) === identity) continue;
+						processesToSignal.set(pid, identity);
+						terminatedProcessStartIdentities.set(pid, identity);
+					}
+				}
+				// 重复 TERM 可打断 once handler 的优雅释放；缺证只能留待升级或最终 unknown。
+				if (processesToSignal.size > 0) await signalMatchingOwnedProcesses(processesToSignal, signal);
+			};
+			const recoverOwnedDescendants = async () => {
+				try {
+					const recovered = await observeExecutionOwnedProcesses({
+						executionOwnershipToken,
+						executionStartedAtEpochMs,
+						recordedStartIdentities: ownedProcessStartIdentities,
+					});
+					for (const [pid, identity] of recovered.ownedStartIdentities)
+						ownedProcessStartIdentities.set(pid, identity);
+					return recovered;
+				} catch {
+					return { ownedStartIdentities: new Map<number, string>(), hasUnprovenOrphanOwnership: true };
+				}
+			};
 			let observationInFlight: Promise<void> | null = null;
 			const observeOwnership = (): Promise<void> => {
 				if (settled) return Promise.resolve();
 				if (observationInFlight) return observationInFlight;
 				observationInFlight = (async () => {
 					if (!child.pid) return;
-					try {
-						extendOwnedProcessStartIdentities(
-							await readNativeProcessOwnershipSnapshot(),
-							child.pid,
-							ownedProcessStartIdentities,
-						);
-					} catch {
-						// 缺证保留未知，下一次观察自动重验。
-					}
+					// 首次身份由 token 正向证明；后续也持续恢复新生、已脱离父链的后代。
+					await recoverOwnedDescendants();
 					if (settled) return;
 					try {
 						request.onProcessObservation?.({
@@ -235,6 +270,23 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 					} catch {
 						// 宿主观察出口失败不终止角色；持久缺证由宿主下一次观察补齐。
 					}
+					if (settled || cancellationRequestedAtEpochMs === null) return;
+					const signal = Date.now() - cancellationRequestedAtEpochMs >= 2_000 ? "SIGKILL" : "SIGTERM";
+					await signalOwnedProcessesForCancellation(signal);
+					if (settled || !processExitConfirmed) return;
+					const finalOwnership = await recoverOwnedDescendants();
+					if (
+						!settled &&
+						!finalOwnership.hasUnprovenOrphanOwnership &&
+						finalOwnership.ownedStartIdentities.size === 0
+					) {
+						settle({
+							outputText: stderrText.trim() === "" ? stdoutText : stderrText,
+							stopReason: "cancelled",
+							forkedNativeSessionId: forkedSessionId,
+							cancellationConfirmation: "confirmed",
+						});
+					}
 				})().finally(() => {
 					observationInFlight = null;
 				});
@@ -243,40 +295,20 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 			const ownershipObservationTimer = setInterval(() => {
 				void observeOwnership();
 			}, 250);
-			let descendantRecoveryInFlight: ReturnType<typeof observeExecutionOwnedProcesses> | null = null;
-			const recoverOwnedDescendants = (): ReturnType<typeof observeExecutionOwnedProcesses> => {
-				if (!descendantRecoveryInFlight) {
-					descendantRecoveryInFlight = observeExecutionOwnedProcesses({
-						executionOwnershipToken,
-						executionStartedAtEpochMs,
-						recordedStartIdentities: ownedProcessStartIdentities,
-					})
-						.then((recovered) => {
-							for (const [pid, identity] of recovered.ownedStartIdentities)
-								ownedProcessStartIdentities.set(pid, identity);
-							return recovered;
-						})
-						.catch(() => ({ ownedStartIdentities: new Map<number, string>(), hasUnprovenOrphanOwnership: true }))
-						.finally(() => {
-							descendantRecoveryInFlight = null;
-						});
-				}
-				return descendantRecoveryInFlight;
-			};
 			const onAbort = (): void => {
 				if (stopReasonOverride === "cancelled" || settled) return;
 				stopReasonOverride = "cancelled";
+				cancellationRequestedAtEpochMs = Date.now();
 				if (!processExitConfirmed) child.kill("SIGTERM");
-				void observeOwnership()
-					.then(recoverOwnedDescendants)
-					.then(() => signalMatchingOwnedProcesses(ownedProcessStartIdentities, "SIGTERM"));
+				void signalOwnedProcessesForCancellation("SIGTERM");
+				void observeOwnership();
 				cancellationEscalationTimer = setTimeout(() => {
 					if (!processExitConfirmed) child.kill("SIGKILL");
-					void signalMatchingOwnedProcesses(ownedProcessStartIdentities, "SIGKILL");
+					void signalOwnedProcessesForCancellation("SIGKILL");
+					void observeOwnership();
 				}, 2_000);
 				cancellationConfirmationTimer = setTimeout(() => {
-					void signalMatchingOwnedProcesses(ownedProcessStartIdentities, "SIGKILL");
-					// 清理窗口到点不代表全树退出；close 的完整归属核验未完成时一律未知。
+					// 清理窗口到点不代表全树退出；完整归属核验未完成时一律未知。
 					settle({
 						outputText: stderrText || stdoutText,
 						stopReason: "cancelled",
@@ -295,6 +327,7 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 			});
 			child.once("exit", () => {
 				processExitConfirmed = true;
+				if (cancellationRequestedAtEpochMs !== null) void observeOwnership();
 			});
 
 			const settle = (result: ForkedWorkBranchResult): void => {
@@ -327,24 +360,8 @@ export class ClaudeCodeForkedSessionWorkBranchExecutor implements ForkedWorkBran
 			child.on("close", async (exitCode) => {
 				// 补查归属会让出执行权，取消资格必须在最后一次等待后重新核验。
 				await observeOwnership();
-				if (stopReasonOverride !== null) {
-					await recoverOwnedDescendants();
-					await confirmOwnedProcessCancellation(ownedProcessStartIdentities);
-					const finalOwnership = await recoverOwnedDescendants();
-					const cancellationConfirmation =
-						processExitConfirmed &&
-						!finalOwnership.hasUnprovenOrphanOwnership &&
-						finalOwnership.ownedStartIdentities.size === 0
-							? "confirmed"
-							: "unknown";
-					settle({
-						outputText: stderrText.trim() === "" ? stdoutText : stderrText,
-						stopReason: stopReasonOverride,
-						cancellationConfirmation,
-						forkedNativeSessionId: forkedSessionId,
-					});
-					return;
-				}
+				// 取消清理不依赖 close，根提前 close 也不能跳过后代的 TERM 宽限期。
+				if (settled || stopReasonOverride !== null) return;
 				const envelope = parsePrintModeResultEnvelope(stdoutText);
 				if (envelope === null) {
 					settle({

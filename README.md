@@ -124,12 +124,14 @@ agent-conversation-exploration-thread-graph doctor --session "$SESSION_JSON"
 
 ### 分身执行、取消与进度
 
-分身请求、维护入口和 CLI 均没有 Agent 总运行时限，不再接受 `timeoutMs` 或 `--timeout-ms`。健康进程可以持续输出或保持静默，直到原生正常结束。通过 `signal: AbortSignal` 显式取消；CLI 的 `SIGINT` / `SIGTERM` 会转为同一取消信号。
+分身请求、维护入口和 CLI 均没有 Agent 总运行时限，不再接受 `timeoutMs` 或 `--timeout-ms`。健康进程可以持续输出或保持静默，直到原生正常结束。通过 `signal: AbortSignal` 显式取消；CLI 的 `SIGINT` / `SIGTERM`（含重复信号）会转为同一取消信号，并持续等待清理结束。fork 已返回时，维护作业在获取写锁及重读 turn 后仍检查取消，取消的提案不再落盘。
 
-Claude 执行器观察进程启动身份与已识别后代，使用 `onProcessObservation` 回报进程归属、最近观察和输出活动，供宿主持久保存。取消后先发 `SIGTERM`，两秒后必要时升级 `SIGKILL`；返回的 `cancellationConfirmation` 区分本地停止确认和未知，不把信号发送冒充远端服务已取消。PID 身份变化时不发送信号，查询缺证时保留未知。
+Claude 执行器观察进程启动身份与已识别后代，使用 `onProcessObservation` 回报进程归属、最近观察和输出活动，供宿主持久保存。取消后先发 `SIGTERM`，两秒后必要时升级 `SIGKILL`；根进程先退出不缩短后代的优雅清理窗口。五秒清理窗口内持续补查 token 可证的后代，不依赖输出管道关闭。返回的 `cancellationConfirmation` 区分本地停止确认和未知，不把信号发送冒充远端服务已取消。PID 启动身份变化时不发送信号，PGID 改变不代表原进程退出；查询缺证时保留未知。
 
 dsh 只在调用方明确取消后向 provider 发 `AbortSignal`。provider 返回结束回执才确认停止；取消后五秒仍未返回则报告确认未知。该窗口只约束取消确认等待，不限制 Agent 自身运行时间。单次 `ps` 查询等操作仍有独立超时。
 
 宿主可在 `executionOwnershipToken` 中传入已持久登记的随机执行归属，并通过可等待的 `beforeProcessSpawn` 屏障先保存 dispatch intent；进程入口在屏障结束后再次核验取消。`onProcessObservation` 回报同一个 token。恢复查询只将 NUL 边界原生环境中的独立 token 键用作正向归属：Darwin 使用 `KERN_PROCARGS2`，Linux 使用 `/proc/<pid>/environ`；argv 或其他环境值里的 token 文本不算归属。token 缺席、查询失败、清空环境或父链缺失的孤儿不能证明退出。进程时间查询和解析均固定 UTC，避免夏令时回拨漏掉新后代。取消后的最终补查仍有未知孤儿时，或五秒清理窗口内未取得完整证据时，确认保持 `unknown`。原生开机 UUID 变化可以证明旧代进程已全部退出，不通过墙钟推算代际。
+
+派发屏障未结束时也可取消，立即返回 `cancelled/not_started`，屏障后来完成不再启动进程。启动身份是不透明的 PID + 原生启动时间，不包含可变 PGID。取消与恢复仍接受旧版 PID + PGID + 启动时间记录，按 PID 与出生信息核对；同一进程改变 PGID 或缺少 token 不影响已确认记录扩展后代，出生信息变化则不发信号，无法识别的格式保留 `unknown`。消费方无需转换或丢弃旧记录。空登记表不能仅凭根 PID 建立归属，`extendOwnedProcessStartIdentities` 只扩展已确认身份。未能证明归属的新生进程，即使被存活的 subreaper 收养，也保留 `unknown`，不对它发送取消信号。
 
 Darwin 的新生孤儿补证还读取内核的原始父进程代际，排除可证明由 launchd 直接启动的系统服务；不按名字猜测进程归属。该只读辅助程序从模块内保存的 C 源码生成可再生的本机缓存，不改宿主配置；编译或内核查询不可用时保留未知，编译器或存储证据变化后自动重验。缓存不属于跨任务交接产物。

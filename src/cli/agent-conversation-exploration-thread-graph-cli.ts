@@ -301,8 +301,9 @@ async function runMaintainSubcommand(
 
 	const cancellationController = new AbortController();
 	const cancel = (): void => cancellationController.abort();
-	process.once("SIGINT", cancel);
-	process.once("SIGTERM", cancel);
+	// 清理结束前持续接管重复信号，避免第二次信号绕过执行器的升级清理。
+	process.on("SIGINT", cancel);
+	process.on("SIGTERM", cancel);
 	let result: Awaited<ReturnType<typeof runExplorationThreadGraphMaintenanceJob>>;
 	try {
 		result = await runExplorationThreadGraphMaintenanceJob({

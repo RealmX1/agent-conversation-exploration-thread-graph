@@ -342,6 +342,12 @@ dsh 插件只做到 smoke（无 UI、不引 `@deepseek-ai/*` 依赖），未在 
    - store 现在除进程内写队列外还有**跨进程锁文件**（`O_CREAT|O_EXCL` + 15s 陈旧回收、20s 等锁上限）。
      宿主若把 `maintain` 挂在 Stop hook 上，多个 CLI 进程并发不再丢写；但也意味着
      `storeRoot` 里会出现一个 `.lock` 文件，备份与清理逻辑要放过它。
+6. **无总时限执行的取消与恢复契约修正**：
+   - `beforeProcessSpawn` 尚未结束时，显式取消立即返回 `cancelled/not_started`；屏障之后才完成也不得派发。
+   - Claude 取消清理在五秒窗口内持续重新发现 token 可证归属，不依赖根进程的输出管道 `close`；`SIGTERM` 后保留两秒优雅退出窗口，再必要升级 `SIGKILL`。查询失败或未知归属仍返回 `unknown`。
+   - `processStartIdentity` 是不透明的 PID + 原生启动时间，不含可变 PGID；PGID 只用于归属扩展。取消与恢复兼容旧版 PID + PGID + 启动时间记录，按 PID 与出生信息核对，即使 PGID 改变或 token 缺席仍可扩展已确认后代；出生信息变化不发信号，格式无法核对则保留 `unknown`，不能把格式变化当成退出。空表不能仅凭根 PID 建立归属；`extendOwnedProcessStartIdentities` 只扩展已正向确认的身份。消费方不必丢弃或自行转换旧记录。
+   - 执行后新生且无法证明归属的进程，即使父进程仍存活（含 Linux subreaper 收养），也不是退出证据；只排除可证的其他用户或服务管理器来源，以及本次只读查询自身。
+   - CLI 在取消清理完成前持续接管重复 `SIGINT` / `SIGTERM`。维护作业在 fork 返回、获取写锁及锁内重读之后核验取消，取消后不再将提案交给漏斗落盘，返回既有 `fork_failed/cancelled`。
 
 ## A.14 假设与风险（接手时知道即可）
 

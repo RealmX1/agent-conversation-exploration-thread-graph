@@ -35,13 +35,15 @@ export async function readNativeProcessOwnershipSnapshot(): Promise<Map<number, 
 		if (!match) throw new Error("原生进程表格式不完整，退出证据未知");
 		if (/^[ZX]/u.test(match[4] ?? "")) continue;
 		const processPid = Number(match[1]);
+		// 本次只读查询自身不是执行期间遗留的后代；只按精确子进程 PID 排除。
+		if (processPid === query.child.pid) continue;
 		const startedAt = Date.parse(`${match[5] ?? ""} GMT`);
 		if (!Number.isFinite(startedAt)) throw new Error("原生启动时间不可解析，退出证据未知");
 		snapshot.set(processPid, {
 			processPid,
 			parentProcessPid: Number(match[2]),
 			processGroupId: Number(match[3]),
-			startIdentity: `${processPid} ${match[3]} ${match[5]}`,
+			startIdentity: `${processPid} ${match[5]}`,
 			startTimeEpochMs: startedAt,
 			commandArgumentsText: match[6] ?? "",
 		});
@@ -60,16 +62,36 @@ export async function readNativeSystemBootIdentity(): Promise<string | null> {
 	return null;
 }
 
+// 旧版持久记录含可变 PGID；格式差异不能证明出生代际变化。
+function compareNativeProcessStartIdentities(
+	observedIdentity: string | undefined,
+	recordedIdentity: string | undefined,
+): "same" | "different" | "unknown" {
+	if (observedIdentity === undefined) return "different";
+	if (recordedIdentity === undefined) return "unknown";
+	if (observedIdentity === recordedIdentity) return "same";
+	const identityPattern = /^(\d+)\s+(?:\d+\s+)?(\S+\s+\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})$/u;
+	const observed = observedIdentity.match(identityPattern);
+	const recorded = recordedIdentity.match(identityPattern);
+	if (!observed || !recorded) return "unknown";
+	const observedStartedAt = Date.parse(`${observed[2]} GMT`);
+	const recordedStartedAt = Date.parse(`${recorded[2]} GMT`);
+	if (!Number.isFinite(observedStartedAt) || !Number.isFinite(recordedStartedAt)) return "unknown";
+	return observed[1] === recorded[1] && observedStartedAt === recordedStartedAt ? "same" : "different";
+}
+
 export function extendOwnedProcessStartIdentities(
 	snapshot: ReadonlyMap<number, NativeOwnedProcessObservation>,
 	rootProcessPid: number,
 	recordedStartIdentities: Map<number, string>,
 ): void {
-	const root = snapshot.get(rootProcessPid);
-	if (!recordedStartIdentities.size && root) recordedStartIdentities.set(rootProcessPid, root.startIdentity);
+	// 根 PID 本身不构成归属证据，只能从 token 或既有启动身份扩展。
 	const confirmedOwnedProcessPids = new Set(
 		[...recordedStartIdentities]
-			.filter(([pid, identity]) => snapshot.get(pid)?.startIdentity === identity)
+			.filter(
+				([pid, identity]) =>
+					compareNativeProcessStartIdentities(snapshot.get(pid)?.startIdentity, identity) === "same",
+			)
 			.map(([pid]) => pid),
 	);
 	let added = true;
@@ -111,35 +133,48 @@ export async function observeExecutionOwnedProcesses(input: {
 	const owned = new Map(input.recordedStartIdentities);
 	let hasUnprovenOrphanOwnership = false;
 	for (const nativeProcess of liveSnapshot.values()) {
-		if (snapshot.get(nativeProcess.processPid)?.startIdentity !== nativeProcess.startIdentity) continue;
+		if (
+			compareNativeProcessStartIdentities(
+				nativeProcess.startIdentity,
+				snapshot.get(nativeProcess.processPid)?.startIdentity,
+			) !== "same"
+		)
+			continue;
 		if (environments.get(nativeProcess.processPid)?.hasExecutionOwnershipToken === true)
 			owned.set(nativeProcess.processPid, nativeProcess.startIdentity);
 	}
 	// 已登记或 token 可证的后代继续通过父链和进程组补齐，不受环境清空影响。
 	for (const [pid, identity] of [...owned]) {
-		if (liveSnapshot.get(pid)?.startIdentity === identity)
-			extendOwnedProcessStartIdentities(liveSnapshot, pid, owned);
+		const identityComparison = compareNativeProcessStartIdentities(liveSnapshot.get(pid)?.startIdentity, identity);
+		if (identityComparison === "same") extendOwnedProcessStartIdentities(liveSnapshot, pid, owned);
+		else if (identityComparison === "unknown") hasUnprovenOrphanOwnership = true;
 	}
 	const potentialOrphans = [...liveSnapshot.values()].filter(
 		(nativeProcess) =>
-			owned.get(nativeProcess.processPid) !== nativeProcess.startIdentity &&
+			compareNativeProcessStartIdentities(nativeProcess.startIdentity, owned.get(nativeProcess.processPid)) !==
+				"same" &&
 			nativeProcess.processPid !== process.pid &&
-			(nativeProcess.startTimeEpochMs === undefined || nativeProcess.startTimeEpochMs >= startedAtFloor) &&
-			(nativeProcess.parentProcessPid <= 1 || !liveSnapshot.has(nativeProcess.parentProcessPid)),
+			(nativeProcess.startTimeEpochMs === undefined || nativeProcess.startTimeEpochMs >= startedAtFloor),
 	);
 	for (const nativeProcess of potentialOrphans) {
 		const origin =
-			snapshot.get(nativeProcess.processPid)?.startIdentity === nativeProcess.startIdentity
+			compareNativeProcessStartIdentities(
+				nativeProcess.startIdentity,
+				snapshot.get(nativeProcess.processPid)?.startIdentity,
+			) === "same"
 				? environments.get(nativeProcess.processPid)
 				: undefined;
 		if (origin?.outsideCurrentUser || origin?.launchedByServiceManager) continue;
-		// env -i 的孤儿与归属无法核验的新孤儿不能区分，缺 token 不构成退出证明。
+		// subreaper 可收养孤儿；父 PID 仍存在也不能排除清空环境、未被采样的后代。
 		hasUnprovenOrphanOwnership = true;
 	}
 
 	return {
 		ownedStartIdentities: new Map(
-			[...owned].filter(([pid, identity]) => liveSnapshot.get(pid)?.startIdentity === identity),
+			[...owned].filter(
+				([pid, identity]) =>
+					compareNativeProcessStartIdentities(liveSnapshot.get(pid)?.startIdentity, identity) === "same",
+			),
 		),
 		hasUnprovenOrphanOwnership,
 	};
@@ -153,8 +188,10 @@ export async function signalMatchingOwnedProcesses(
 		const snapshot = await readNativeProcessOwnershipSnapshot();
 		let alive = false;
 		for (const [pid, identity] of recordedStartIdentities) {
-			if (snapshot.get(pid)?.startIdentity !== identity) continue;
+			const identityComparison = compareNativeProcessStartIdentities(snapshot.get(pid)?.startIdentity, identity);
+			if (identityComparison === "different") continue;
 			alive = true;
+			if (identityComparison === "unknown") continue;
 			try {
 				process.kill(pid, signal);
 			} catch (error) {

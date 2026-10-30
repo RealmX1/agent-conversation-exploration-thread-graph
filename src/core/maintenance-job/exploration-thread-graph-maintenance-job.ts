@@ -190,10 +190,10 @@ export async function runExplorationThreadGraphMaintenanceJob(
 		...(input.signal !== undefined ? { signal: input.signal } : {}),
 	});
 	const usage = toMaintenanceJobUsage(forkResult.usage);
-	if (forkResult.stopReason !== "completed" || forkResult.structured === undefined) {
+	if (input.signal?.aborted || forkResult.stopReason !== "completed" || forkResult.structured === undefined) {
 		return {
 			outcome: "fork_failed",
-			stopReason: forkResult.stopReason,
+			stopReason: input.signal?.aborted ? "cancelled" : forkResult.stopReason,
 			outputTextExcerpt: forkResult.outputText.slice(0, 400),
 		};
 	}
@@ -203,14 +203,25 @@ export async function runExplorationThreadGraphMaintenanceJob(
 	//    重读与对账、落装同在一把 storeRoot 队列锁内，中间不会再被新 turn 穿插。
 	let applyRejectionReason: ExplorationThreadGraphApplyRejectionReason | null = null;
 	let placedTurnCount = 0;
+	let applyCancelled = false;
 
 	await mutateExplorationThreadGraph(
 		input.storeRoot,
 		input.explorationId,
 		async (snapshot) => {
+			// 等锁期间的取消不能继续重读或落盘。
+			if (input.signal?.aborted) {
+				applyCancelled = true;
+				return null;
+			}
 			const turnSnapshotsBySessionAtApplyTime = buildTurnSnapshotsBySessionFromPairs(
 				await readTurnSnapshotsPairedWithSessionRefs(input.sessions, input.turnSource),
 			);
+			// 重读 turn 也是异步窗口；取消后连 stale 标记都不能写。
+			if (input.signal?.aborted) {
+				applyCancelled = true;
+				return null;
+			}
 			const applyResult = applyExplorationThreadGraphMaintenanceProposal({
 				explorationId: input.explorationId,
 				proposal: forkResult.structured,
@@ -235,6 +246,13 @@ export async function runExplorationThreadGraphMaintenanceJob(
 		now,
 	);
 
+	if (applyCancelled) {
+		return {
+			outcome: "fork_failed",
+			stopReason: "cancelled",
+			outputTextExcerpt: forkResult.outputText.slice(0, 400),
+		};
+	}
 	if (applyRejectionReason !== null) {
 		return { outcome: "rejected", rejectionReason: applyRejectionReason, usage };
 	}
