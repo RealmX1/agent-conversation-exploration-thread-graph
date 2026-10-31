@@ -78,3 +78,8 @@
 - `processStartIdentity` 不再包含可变 PGID，避免 `setsid` / `setpgid` 被误判为退出；它仍是不透明值，消费方不得依赖内部格式。取消与恢复内部兼容旧版 PID + PGID + 启动时间记录，按 PID 与出生信息核对，不要求消费方丢弃旧记录或以 token 重建；无法核对格式时保留 `unknown`，出生信息变化时不发信号。旧版已确认记录在 token 缺席时仍可扩展后代。`extendOwnedProcessStartIdentities` 不再自动登记空表下的根 PID，调用方需先以 token 或已确认身份建立归属，避免首次观察前 PID 被复用后误杀。无新增公开 API 或实体 schema。
 - 新生且无法核验归属的进程，即使父进程仍存在（包括 Linux subreaper），也保留 `unknown`；仅排除可证的其他用户、服务管理器来源与只读查询自身，不凭父 PID 推断退出。
 - CLI 在整个取消清理期间持续接管重复 `SIGINT` / `SIGTERM`；维护作业在 fork 后、等待写锁及锁内重读后再次核验取消，不再接受或落盘已取消提案。复用既有 `fork_failed/cancelled` 结果；实体 schema 与版本不变。
+
+### 宿主共享的进程身份比较接口
+
+- `/harness-claude-code` 新增公开导出 `compareNativeProcessStartIdentities`，复用已有纯比较逻辑，以 `same` / `different` / `unknown` 区分同一出生身份、不同身份和缺证，兼容含 PGID 的旧持久记录。**消费方需要改**：宿主控制进程记录改用该接口，不直接比较字符串，也不自行解析格式；查询失败与成功快照中的进程缺席须分开处理，`unknown` 保留并自动重验。
+- 明确宿主须将覆盖整个维护作业的取消 `signal` 传给 `runExplorationThreadGraphMaintenanceJob`，使 fork 返回后等待锁与重读期间的取消检查生效。本次仅增加比较接口的导出，不改变比较算法、图投影形状或实体 schema 版本。

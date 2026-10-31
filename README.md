@@ -134,4 +134,6 @@ dsh 只在调用方明确取消后向 provider 发 `AbortSignal`。provider 返�
 
 派发屏障未结束时也可取消，立即返回 `cancelled/not_started`，屏障后来完成不再启动进程。启动身份是不透明的 PID + 原生启动时间，不包含可变 PGID。取消与恢复仍接受旧版 PID + PGID + 启动时间记录，按 PID 与出生信息核对；同一进程改变 PGID 或缺少 token 不影响已确认记录扩展后代，出生信息变化则不发信号，无法识别的格式保留 `unknown`。消费方无需转换或丢弃旧记录。空登记表不能仅凭根 PID 建立归属，`extendOwnedProcessStartIdentities` 只扩展已确认身份。未能证明归属的新生进程，即使被存活的 subreaper 收养，也保留 `unknown`，不对它发送取消信号。
 
+宿主比较持久控制进程身份时，使用 `/harness-claude-code` 的 `compareNativeProcessStartIdentities`，返回 `same` / `different` / `unknown`，复用新旧格式兼容。仅在成功、完整的原生快照中未找到进程时，才将 observed identity 传为 `undefined`（返回 `different`）；查询失败保留未知，不转换为进程缺席。该函数只比较出生身份，不建立归属或发送信号。宿主的 Stop 监听须覆盖整个维护作业并传入 `signal`，不能在分身返回时就结束，否则无法覆盖等锁期间的取消。
+
 Darwin 的新生孤儿补证还读取内核的原始父进程代际，排除可证明由 launchd 直接启动的系统服务；不按名字猜测进程归属。该只读辅助程序从模块内保存的 C 源码生成可再生的本机缓存，不改宿主配置；编译或内核查询不可用时保留未知，编译器或存储证据变化后自动重验。缓存不属于跨任务交接产物。

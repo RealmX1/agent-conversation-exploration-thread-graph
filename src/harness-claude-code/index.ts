@@ -29,6 +29,7 @@ export {
 } from "./claude-code-transcript-record-classifier.js";
 
 export {
+	compareNativeProcessStartIdentities,
 	confirmOwnedProcessCancellation,
 	extendOwnedProcessStartIdentities,
 	FORKED_WORK_BRANCH_EXECUTION_OWNERSHIP_ENVIRONMENT_KEY,

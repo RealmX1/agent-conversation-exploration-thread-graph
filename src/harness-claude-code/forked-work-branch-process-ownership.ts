@@ -62,8 +62,11 @@ export async function readNativeSystemBootIdentity(): Promise<string | null> {
 	return null;
 }
 
-// 旧版持久记录含可变 PGID；格式差异不能证明出生代际变化。
-function compareNativeProcessStartIdentities(
+/**
+ * 比较不透明启动身份，兼容含可变 PGID 的旧持久记录；无法核对时保留 unknown。
+ * observedIdentity 缺失只表示成功、完整快照中的进程缺席，查询失败不可转换为此输入。
+ */
+export function compareNativeProcessStartIdentities(
 	observedIdentity: string | undefined,
 	recordedIdentity: string | undefined,
 ): "same" | "different" | "unknown" {

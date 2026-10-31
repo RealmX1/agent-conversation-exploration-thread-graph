@@ -311,11 +311,14 @@ dsh 插件只做到 smoke（无 UI、不引 `@deepseek-ai/*` 依赖），未在 
 ## A.13 与 cline-kanban 的契约（两个 pass 的共享真相）
 
 1. cline-kanban 依赖 `github:RealmX1/agent-conversation-exploration-thread-graph#<sha>`，`import` 子路径 `/core` 与 `/harness-claude-code`；web-ui 只 import `/core` 的**类型与纯函数**（projection view 类型、`layoutThreadGraphLanes`）。
-   **当前应固定的 SHA：`4fd33ae34c9e2cc6d1b24ee4a8a12b9aa6aa2bb8`**——代码冻结在这一笔；其后的提交只改
+   **Pass A 历史固定 SHA：`4fd33ae34c9e2cc6d1b24ee4a8a12b9aa6aa2bb8`**——该轮代码冻结在这一笔；该轮后续提交只改
    `.plan/` 与 `AGENTS.md`（`src/` / `test/` / `package.json` 零改动），钉分支顶端装到的包与它完全相同。
    tag `v0.1.0` 指向顶端那笔文档提交而非 `4fd33ae`，理由是 tag 该落在「代码对、文档也对」的一版。
    两者都已随 `origin/task-bcb8b-exploration-thread-graph-core-pass-a` push 到 GitHub，`github:` 形式可直接安装；
    tag 本身未 push（`github:` 依赖走 SHA，不需要它）。本地联调仍可用 `npm link`。
+   **后续升级注意**：上述 SHA 不含后来的无总时限执行、取消修正及共享进程身份比较接口，不能作为当前升级目标。
+   消费方应将依赖与锁文件一起固定到包含所需契约、已经验证的实际提交，并核对安装产物的 resolved SHA 与公开导出；
+   本地提交、进入 local main 与远端可安装是不同事实，不得互相代替。
    注意 `package.json` 的 `files` 只含 `dist` / `README.md` / `CONTEXT.md`——`.plan/` 下的 handoff 与完工交接
    **不进 npm 包**，要读得直接看仓库。
 2. cline-kanban 提供：`explorationId = workspaceTaskId`；`sessions[]`（主会话在前；每条含 `nativeSessionId` / `transcriptPath` / `workingDirectory` / `launchArgvTemplate{model, appendSystemPrompt, settingsPath, extraArgs}` / by-the-way 的 `forkedFromParentSessionTurnNumber`）；`storeRoot`；触发时机（Stop 边沿 + 防抖 + 每 exploration 并发 1）。
@@ -346,8 +349,10 @@ dsh 插件只做到 smoke（无 UI、不引 `@deepseek-ai/*` 依赖），未在 
    - `beforeProcessSpawn` 尚未结束时，显式取消立即返回 `cancelled/not_started`；屏障之后才完成也不得派发。
    - Claude 取消清理在五秒窗口内持续重新发现 token 可证归属，不依赖根进程的输出管道 `close`；`SIGTERM` 后保留两秒优雅退出窗口，再必要升级 `SIGKILL`。查询失败或未知归属仍返回 `unknown`。
    - `processStartIdentity` 是不透明的 PID + 原生启动时间，不含可变 PGID；PGID 只用于归属扩展。取消与恢复兼容旧版 PID + PGID + 启动时间记录，按 PID 与出生信息核对，即使 PGID 改变或 token 缺席仍可扩展已确认后代；出生信息变化不发信号，格式无法核对则保留 `unknown`，不能把格式变化当成退出。空表不能仅凭根 PID 建立归属；`extendOwnedProcessStartIdentities` 只扩展已正向确认的身份。消费方不必丢弃或自行转换旧记录。
+   - `/harness-claude-code` 公开 `compareNativeProcessStartIdentities(observedIdentity: string | undefined, recordedIdentity: string | undefined): "same" | "different" | "unknown"`，供宿主比较持久控制进程身份，复用上述新旧格式兼容；不要自行解析或直接以字符串不等判退出。相等的不透明值返回 `same`；可解析且 PID 或出生时间不同返回 `different`；记录缺失或两个不同值无法核对时返回 `unknown`。`observedIdentity === undefined` 只表示一次成功、完整的原生快照中没有该进程，返回 `different`；查询失败不得转换为这个输入。`unknown` 继续保留、等待原生证据恢复，不作为退出或发信号的资格。该纯比较函数不建立作业归属，也不发送信号。
    - 执行后新生且无法证明归属的进程，即使父进程仍存活（含 Linux subreaper 收养），也不是退出证据；只排除可证的其他用户或服务管理器来源，以及本次只读查询自身。
    - CLI 在取消清理完成前持续接管重复 `SIGINT` / `SIGTERM`。维护作业在 fork 返回、获取写锁及锁内重读之后核验取消，取消后不再将提案交给漏斗落盘，返回既有 `fork_failed/cancelled`。
+   - 宿主若提供显式 Stop，取消作用域须覆盖整个 `runExplorationThreadGraphMaintenanceJob` 并传入 `signal`，直到维护作业返回才结束监听；只在 `executor.start` 内监听无法覆盖 fork 返回后等待写锁、重读和落盘前的取消窗口。
 
 ## A.14 假设与风险（接手时知道即可）
 
